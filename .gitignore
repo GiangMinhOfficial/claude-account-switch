@@ -1,0 +1,5 @@
+# Nothing account-specific belongs in this repo.
+# Account data lives in ~/.claude-<name> and ~/.claude-shared, never here.
+*.credentials.json
+.claude.json
+*.local.ps1
