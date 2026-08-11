@@ -15,10 +15,17 @@ is no separate alias layer and no persisted name mapping.
 
 Established by inspection on a machine with seven live account dirs, not assumed:
 
-- **No file inside an account dir references its own directory name.** Scanned every
-  top-level file of every `~/.claude-*` dir; zero self-references. Junction targets are
-  absolute paths into `~/.claude-shared`, so they are unaffected by renaming the parent.
-  A plain `Rename-Item` is therefore sufficient — nothing inside needs rewriting.
+- **No file inside an account dir references its own directory name.** Scanned
+  *recursively*, skipping reparse points so the walk never crosses into the shared store:
+  114 files across six accounts, 78 of them in `.claude-work`, zero self-references.
+  Junction targets are absolute paths into `~/.claude-shared`, so they are unaffected by
+  renaming the parent. `Rename-Item -LiteralPath` is therefore sufficient — nothing
+  inside needs rewriting.
+
+  Caveat on the strength of this evidence: it is one machine's accounts at one point in
+  time, not a guarantee about the format. If a future Claude Code version starts writing
+  its own config path into the account dir, this design silently breaks. The recursive
+  scan is cheap to re-run and worth repeating if rename ever misbehaves.
 - **The current launcher body does not abort on error.** `Use-ClaudeAccount '<name>';
   claude @args` writes the error and then launches `claude` anyway, under whatever
   config dir the shell currently holds. A stale launcher after a rename would drop the
@@ -101,11 +108,16 @@ preference propagation, but a plain assignment to `$env:CLAUDE_CONFIG_DIR` and a
 `Write-Host` success message do not. Verified: with no gate, `-WhatIf` left the directory
 unrenamed while still mutating the variable and printing "renamed successfully".
 
-The rename runs inside `try`/`catch` with `-ErrorAction Stop`. Without the `try`, a
-locked directory would write a non-terminating error and fall through to the launcher
-swap, deregistering functions for an account that never moved. On failure the message
-names the cause: the account appears to be in use, close Claude Code running on it and
-retry, followed by the underlying exception message.
+The rename itself is `Rename-Item -LiteralPath $src -NewName ".claude-$NewName"
+-ErrorAction Stop`, inside `try`/`catch`. Without the `try`, a locked directory would
+write a non-terminating error and fall through to the launcher swap, deregistering
+functions for an account that never moved.
+
+The catch message must not assert a cause. `Rename-Item` also fails on permissions, path
+length, and I/O errors, and claiming "the account is in use" for those sends the user
+hunting a process that does not exist. The wording is "Could not rename `<src>`", then the
+underlying exception message, then a hint — *if Claude Code is running on this account,
+close it and retry* — phrased as a possibility rather than a diagnosis.
 
 After a successful rename:
 
@@ -117,7 +129,12 @@ After a successful rename:
   not shadow an existing command, bare `<new>`.
 - If `$env:CLAUDE_CONFIG_DIR` pointed at the old directory, repoint it at the new one.
   Otherwise the current shell silently holds a dead path.
-- Report success.
+- Report success, **naming the launchers that actually exist**. `Register-ClaudeAccountFunctions`
+  skips the bare launcher when the name would shadow an existing command, and it does so
+  via `Write-Verbose` — invisible by default. Renaming an account to `git` or `code`
+  therefore yields only `claude-git`, and a flat "renamed" message would leave the user
+  typing `git` and getting version control. When the bare launcher is skipped, say so on
+  the success path and name the command that took precedence.
 
 ## The old alias
 
@@ -156,6 +173,21 @@ Two fixes on one line:
   this change already edits. A destination guard rejecting apostrophes would not help —
   `setup-claude-accounts.ps1` can already create them.
 
+  Doubling is a complete fix, not a partial one: a single-quoted PowerShell literal
+  interpolates nothing, so once the quote cannot be closed early, `$`, backtick and `;`
+  in an account name are inert.
+
+**Considered: making `Use-ClaudeAccount` throw instead.** The alternative is to move the
+fail-fast into `Use-ClaudeAccount` itself, so every caller inherits it rather than each
+launcher opting in. Rejected, on two grounds. The launcher body is generated in exactly
+one place, so `-ErrorAction Stop` is one edit and not N — the duplication the objection
+assumes is not there. And the launcher is the only call site where the error is followed
+by a consequential action; a bare `Use-ClaudeAccount typo` at the prompt already fails
+harmlessly, leaving the shell where it was, and making it throw would turn a routine typo
+into a terminating error for no safety gain. The cost is a weaker contract: a future
+caller of `Use-ClaudeAccount` must remember `-ErrorAction Stop`, so the function carries a
+comment saying exactly that.
+
 ## Reuse
 
 **Extract `Test-OurLauncher`** into `claude-account-profile.ps1`: the predicate
@@ -193,7 +225,8 @@ because `mklink /J` cannot resolve a PSDrive path. Each test builds an account d
 Cases:
 
 1. Happy path — directory renamed; `claude-<new>` and `<new>` exist; `claude-<old>` and
-   `<old>` are gone
+   `<old>` are gone. The `<new>` assertion holds only because the fixture picks a name
+   that shadows nothing; it must not be written as an unconditional invariant
 2. The `projects` junction survives, still resolves to the shared store, and the sentinel
    file is intact — the invariant that must never break
 3. Each guard rejects and leaves the directory untouched:
@@ -219,8 +252,12 @@ Cases:
    regression test for the `-ErrorAction Stop` change
 8. An account named `o'clock` gets a working launcher — regression test for the
    apostrophe fix
+9. Renaming to a name that shadows a real command — `git` — creates `claude-git`, leaves
+   `git` itself pointing at version control, and reports the skip. The companion to case
+   5, and the reason case 1's bare-launcher assertion is not an invariant
 
-Teardown restores `$HOME` and removes the `function:global:` entries the tests generated.
+Teardown restores `$HOME`, deletes the fake home directory, and removes the
+`function:global:` entries the tests generated.
 
 **Teardown must unlink junctions before deleting**, using the same `cmd /c rmdir`
 sequence as `Remove-ClaudeAccount`. A plain `Remove-Item -Recurse` on a fixture account
