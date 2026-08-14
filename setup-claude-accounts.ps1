@@ -58,8 +58,23 @@ function Split-ListArg {
 $Accounts   = @(Split-ListArg $Accounts)
 $SharedDirs = @(Split-ListArg $SharedDirs)
 
+# Keep this literal identical to claude-account-profile.ps1's copy.
+# tests/Set-ClaudeAccountName.Tests.ps1 asserts they match. It is duplicated
+# rather than shared because dot-sourcing the profile from here would run
+# Register-ClaudeAccountFunctions as a side effect.
+$ClaudeInvalidNameClass = '[\\/:*?"<>|\[\]]'
+
 foreach ($name in $Accounts) {
-    if ($name -match '[\\/:*?"<>|]') { throw "Invalid account name (path characters): '$name'" }
+    # Brackets: the function: provider treats them as wildcards, so an account
+    # named a[1] gets no launchers at all while everything reports success.
+    if ($name -match $ClaudeInvalidNameClass) {
+        throw "Invalid account name (path characters or brackets): '$name'"
+    }
+    # Windows silently drops a trailing dot: .claude-foo. is created as
+    # .claude-foo, so the account made is not the account asked for.
+    if ($name -match '\.$') {
+        throw "Invalid account name (trailing dot): '$name' - Windows would create '.claude-$($name.TrimEnd('.'))'"
+    }
 }
 
 $Shared = Join-Path $HOME '.claude-shared'

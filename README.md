@@ -20,15 +20,15 @@ variable. Switching accounts becomes setting a variable — no copying, no delet
 Verified against the Claude Code binary (v2.1.63), every identity-bearing path
 follows the config dir:
 
-| Path | Resolves to | Isolated per account |
-|---|---|---|
-| config dir | `CLAUDE_CONFIG_DIR ?? ~/.claude` | — |
-| `.credentials.json` | `join(configDir, ".credentials.json")` | yes |
-| `.claude.json` | `join(CLAUDE_CONFIG_DIR \|\| homedir, ".claude.json")` | yes |
-| `projects/` | `join(configDir, "projects")` | yes |
+| Path                | Resolves to                                            | Isolated per account |
+| ------------------- | ------------------------------------------------------ | -------------------- |
+| config dir          | `CLAUDE_CONFIG_DIR ?? ~/.claude`                       | —                    |
+| `.credentials.json` | `join(configDir, ".credentials.json")`                 | yes                  |
+| `.claude.json`      | `join(CLAUDE_CONFIG_DIR \|\| homedir, ".claude.json")` | yes                  |
+| `projects/`         | `join(configDir, "projects")`                          | yes                  |
 
 Because `projects/` is isolated too, accounts would not see each other's history.
-So the directories that *should* be common live once in `~/.claude-shared` and are
+So the directories that _should_ be common live once in `~/.claude-shared` and are
 exposed to every account through an NTFS **directory junction** — one copy of truth,
 no syncing, no divergence.
 
@@ -72,7 +72,7 @@ cd claude-account-switch
 .\setup-claude-accounts.ps1 -DryRun
 ```
 
-**2. Create the accounts.** `-SeedInto` picks which account inherits your *existing*
+**2. Create the accounts.** `-SeedInto` picks which account inherits your _existing_
 login and settings from `~/.claude`:
 
 ```powershell
@@ -110,14 +110,15 @@ That is the whole setup. `/login` uses the normal OAuth flow.
 
 ## Usage
 
-| Command | Effect |
-|---|---|
-| `claude-work` | Launch Claude Code as `work` (args pass through: `claude-work --resume`) |
-| `claude-personal` | Launch Claude Code as `personal` |
-| `Use-ClaudeAccount work` | Point this shell at `work` **without** launching |
-| `Get-ClaudeAccount` | Show the current account, list all accounts, flag any not logged in |
-| `Reset-ClaudeAccount` | Return this shell to the default `~/.claude` |
-| `Remove-ClaudeAccount personal` | Delete an account safely (see warning below) |
+| Command                              | Effect                                                                   |
+| ------------------------------------ | ------------------------------------------------------------------------ |
+| `claude-work`                        | Launch Claude Code as `work` (args pass through: `claude-work --resume`) |
+| `claude-personal`                    | Launch Claude Code as `personal`                                         |
+| `Use-ClaudeAccount work`             | Point this shell at `work` **without** launching                         |
+| `Get-ClaudeAccount`                  | Show the current account, list all accounts, flag any not logged in      |
+| `Reset-ClaudeAccount`                | Return this shell to the default `~/.claude`                             |
+| `Remove-ClaudeAccount personal`      | Delete an account safely (see warning below)                             |
+| `Rename-ClaudeAccount personal work` | Rename an account and its launchers (see below)                          |
 
 A `claude-<name>` function is generated for every `~/.claude-<name>` directory, plus
 a bare `<name>` alias when it does not shadow an existing command. Adding an account
@@ -174,10 +175,44 @@ Remove-ClaudeAccount client
 ```
 
 > **Never delete an account folder with `Remove-Item -Recurse` or Explorer.**
-> PowerShell 5.1 can follow junctions while recursing and delete the *contents of the
-> shared store* behind them — taking every account's transcripts and skills with it.
+> PowerShell 5.1 can follow junctions while recursing and delete the _contents of the
+> shared store_ behind them — taking every account's transcripts and skills with it.
 > `Remove-ClaudeAccount` unlinks each junction with `rmdir` first (which removes the
 > link, never the target), verifies no reparse points remain, and only then deletes.
+
+Rename:
+
+```powershell
+Rename-ClaudeAccount personal work
+# then open a NEW shell
+```
+
+`~/.claude-personal` becomes `~/.claude-work`, the `personal` launchers are dropped
+and the `work` ones generated. The junctions inside are absolute paths into
+`~/.claude-shared`, so shared history is unaffected. There is no alias layer — the
+directory is the account's name.
+
+Three things to know:
+
+- **Other open shells keep the old launchers.** They loaded the profile into memory
+  and nothing on disk can change that. Open a new shell after renaming.
+  If you installed with `.\install.ps1` (the default), re-run it after pulling
+  changes — `$PROFILE` loads the copy in `~/.claude-shared/bin/`, not the repo.
+- **Do not rename an account that has a live Claude Code session.** Claude Code
+  writes and closes rather than holding handles, so the rename usually _succeeds_ —
+  and the running process, still holding the old `CLAUDE_CONFIG_DIR`, recreates the
+  old directory on its next write. That phantom gets a real `projects/` folder
+  instead of a junction, so it reappears in `Get-ClaudeAccount` as an account and
+  every transcript it writes is invisible from every account, including the renamed
+  one. Exit your sessions first.
+- **An account configured without a shared `projects` cannot be renamed** until
+  Claude Code has run in it once. `Get-ClaudeAccountDir` identifies accounts by
+  their `projects/` entry, so such an account has no launchers either — a
+  pre-existing limitation of the whole profile, not of rename.
+- **Names starting with `claude-` are refused.** An account called `claude-foo`
+  would want the bare launcher `claude-foo`, which is already the _prefixed_
+  launcher of an account called `foo`. Rename blocks both directions of that
+  collision.
 
 ---
 
@@ -186,7 +221,7 @@ Remove-ClaudeAccount client
 - **Your original `~/.claude` is never modified.** Setup only reads from it. It stays
   as a working fallback: any shell without `CLAUDE_CONFIG_DIR` set uses it.
 - **That fallback is also the main gotcha.** A plain `claude` in a fresh shell writes
-  sessions to `~/.claude/projects`, which is *not* the shared store — those sessions
+  sessions to `~/.claude/projects`, which is _not_ the shared store — those sessions
   will not appear on your accounts. Launch through `claude-<name>` to stay consistent.
 - **Credentials are plaintext.** Each `~/.claude-<name>/.credentials.json` holds OAuth
   access and refresh tokens, exactly as stock Claude Code does. Having several means
@@ -194,6 +229,17 @@ Remove-ClaudeAccount client
 - **Shared history is shared in both directions.** If one account is an employer's,
   its transcripts are visible from your personal account and vice versa. To keep a
   particular account separate, remove `projects` from `-SharedDirs` for it.
+- **`claude-<name>` now fails instead of falling back.** Previously, launching an
+  account whose directory was missing printed an error and then started Claude Code
+  anyway, under whatever config dir the shell held — dropping you into the wrong
+  account. The launcher now aborts. A script that calls `claude-work` will stop
+  rather than continue.
+- **`setup-claude-accounts.ps1` now rejects two kinds of name it used to accept:**
+  names containing `[` or `]`, and names ending in a dot. Bracketed names got no
+  launchers at all (PowerShell's `function:` provider reads them as wildcards) while
+  reporting success; trailing dots are silently stripped by Windows, so the account
+  created was never the one asked for. Path characters (`\ / : * ? " < > |`) were
+  already rejected — nothing else changes.
 
 ---
 
@@ -206,6 +252,25 @@ Remove-ClaudeAccount work     # then each account, if you want them gone
 
 `-Uninstall` leaves `~/.claude-shared` and every account directory untouched. Once no
 account junctions point at it any more, delete `~/.claude-shared` by hand.
+
+---
+
+## Testing
+
+Pester 5 is required. Windows ships 3.4.0, which is syntactically incompatible.
+The upgrade needs two things that are easy to miss: TLS 1.2 (PowerShell 5.1
+defaults to TLS 1.0, which PSGallery refuses) and `-SkipPublisherCheck` (the
+shipped copy is Microsoft-signed).
+
+```powershell
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser -Force -SkipPublisherCheck
+
+Import-Module Pester -MinimumVersion 5.0    # both versions stay installed
+Invoke-Pester -Path tests -Output Detailed
+```
+
+The tests run against a temporary fake `$HOME`; they never touch your real accounts.
 
 ---
 

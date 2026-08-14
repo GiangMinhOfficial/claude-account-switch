@@ -1,6 +1,7 @@
 # Rename-ClaudeAccount — design
 
 Date: 2026-08-11
+Revised: 2026-08-12 — corrections after re-verification; see Corrections applied.
 
 ## Goal
 
@@ -27,6 +28,7 @@ are accounts by `Get-ClaudeAccountDir`'s definition, the other two being `.claud
   This is one machine at one point in time, not a guarantee about the format. If a future
   Claude Code version writes its own config path into the account dir, this design breaks
   silently. The scan is cheap to re-run and worth repeating if rename ever misbehaves.
+
 - **The `function:` provider treats `[` and `]` as wildcards, and NTFS allows them in
   directory names.** Verified, and this is the sharpest hazard in the change:
   - `Set-Item -Path "function:global:a[1]"` **reports success and creates nothing**.
@@ -37,6 +39,24 @@ are accounts by `Get-ClaudeAccountDir`'s definition, the other two being `.claud
     even with `-LiteralPath`. Only `Remove-Item -LiteralPath "function:a[2]"` works.
   - NTFS creates `.claude-a[1]` happily, and `Get-ChildItem -Filter '.claude-*'` matches
     it, so such an account is fully real and fully launcher-less.
+- **`Get-Command -Name` wildcards too — the read-side twin of the above.** Verified: a
+  function genuinely present on the `function:` drive as `zzD[4]` is _not_ found by
+  `Get-Command -Name 'zzD[4]'`, and regex-escaping does not help, because the parameter
+  takes a wildcard rather than a regex. Only enumerating the drive and comparing with
+  `-eq`, or `Get-Item -LiteralPath "function:<name>"`, finds it. `-LiteralPath` on the
+  writes is therefore only half the fix: any "is this launcher ours?" test built on
+  `Get-Command -Name` reports _not ours_ for exactly the names the fix exists to rescue.
+- **Dropping the `global:` prefix is safe from inside a helper function.** Verified for a
+  plain name and a bracket name: `Remove-Item -LiteralPath "function:<name>"` called from
+  within a nested function removes the _global_ entry. The prefix is unnecessary as well
+  as harmful, so extracting the removal into a helper costs nothing here.
+- **`Resolve-Path` neither canonicalises a trailing separator nor tolerates a missing
+  path.** Verified: `Resolve-Path '<dir>\'` returns the path _with_ the trailing
+  backslash, so it compares unequal to the same directory resolved without one, and
+  `(Get-Item ...).FullName` behaves identically — only an explicit `.TrimEnd('\','/')`
+  makes them equal. And once the directory is renamed, resolving the old path throws
+  "Cannot find path". Both facts constrain the `CLAUDE_CONFIG_DIR` repoint; see After a
+  successful rename.
 - **`Register-ClaudeAccountFunctions` registers the prefixed launcher unconditionally.**
   `claude-account-profile.ps1:106` has no shadow check; only the bare form at line 116
   does. Renaming can therefore overwrite an unrelated command named `claude-<new>`.
@@ -44,7 +64,7 @@ are accounts by `Get-ClaudeAccountDir`'s definition, the other two being `.claud
   both pass it; neither is an account. `~/.claude-shared` even contains a `projects/`
   entry, so only `Get-ClaudeAccountDir`'s explicit name exclusion rules it out.
 - **The current launcher body does not abort on error.** `Use-ClaudeAccount '<name>';
-  claude @args` writes the error and then launches `claude` anyway, under whatever config
+claude @args` writes the error and then launches `claude` anyway, under whatever config
   dir the shell holds. A stale launcher would drop the user into a session on the wrong
   account. Verified both ways.
 - **`[scriptblock]::Create` throws on an apostrophe in the interpolated account name**,
@@ -55,8 +75,15 @@ are accounts by `Get-ClaudeAccountDir`'s definition, the other two being `.claud
 - **Windows silently normalises trailing dots and whitespace in directory names.**
   Verified: `.claude-foo.` was created as `.claude-foo`, `.claude-<space>` as `.claude-`.
 - **`Rename-Item -NewName` rejects any path-bearing name outright** — "represents a path
-  or device name". Path separators cannot produce traversal; they produce a confusing
-  late failure. This bounds the severity of the character-class bug (see Guards).
+  or device name". Verified. Path separators therefore cannot produce traversal even if a
+  guard were to miss them; they produce a confusing late failure instead. This bounds the
+  severity of any gap in the name class to _which error the user sees and when_.
+- **The existing name class in `setup-claude-accounts.ps1` already handles backslashes.**
+  Verified against the file's raw bytes, not its rendering: line 62 is
+  `'[\\/:*?"<>|]'` — char codes `91,92,92,47,...`, a doubled backslash — and
+  `'..\evil' -match` it returns `True`. An earlier draft of this design claimed the
+  existing rule was `[\/…]` and admitted `..\evil`; that was wrong. Brackets are the only
+  genuine addition to the class.
 - **A live session under a given account cannot be detected.** Cross-process environment
   variables are unreadable (`Win32_Process` exposes no environment property), `claude.exe`
   command lines carry no config dir, and `ide/*.lock` files are unreliable — one in
@@ -89,10 +116,21 @@ Each is an explicit `Write-Error` followed by `return`. All filesystem tests use
    `projects` from `-SharedDirs` for it", and such an account has no `projects/` entry
    until Claude Code creates one — so `Get-ClaudeAccountDir` never returns it, and it has
    no launcher either. Rename inherits that pre-existing blind spot rather than fixing it.
-   The message is therefore "`<name>` is not a recognised account: `~/.claude-<name>` has
-   no `projects/` entry", plus a note that an account created without a shared `projects`
-   becomes renameable once Claude Code has run in it once. This limitation is documented
-   in the README, not silently absorbed.
+
+   **The rejection therefore carries two different messages, chosen by a
+   `Test-Path -LiteralPath` on the directory** — one guard, two diagnoses:
+   - the directory exists but `Get-ClaudeAccountDir` skipped it → "`<name>` is not a
+     recognised account: `~/.claude-<name>` has no `projects/` entry", plus a note that an
+     account created without a shared `projects` becomes renameable once Claude Code has
+     run in it once.
+   - the directory does not exist at all → "No such account: `<name>`".
+
+   A single message cannot serve both. The `projects/` wording asserts that a directory
+   exists, so emitting it for a name that was simply mistyped sends the user looking for a
+   directory that was never there. Note this is `Test-Path` used to _pick a message_, never
+   to decide existence — that decision stays with `Get-ClaudeAccountDir`, for the reason
+   above. The supported-configuration limitation is documented in the README, not silently
+   absorbed.
 
 **Destination**
 
@@ -105,41 +143,56 @@ Each is an explicit `Write-Error` followed by `return`. All filesystem tests use
    `work` → `Work`. Case-only renames are out of scope. Must precede guard 7, which would
    otherwise report the misleading "already exists".
 7. `~/.claude-<new>` already exists.
-8. `claude-<new>` would collide with a command that is not ours. Two cases, both real:
-   - An external command — `Register-ClaudeAccountFunctions` registers the prefixed form
+8. `claude-<new>` would collide. **Two independent checks, not one** — they cannot share an
+   implementation, and collapsing them into a single `Test-OurLauncher` call silently drops
+   the second:
+   - **A foreign command** — `Register-ClaudeAccountFunctions` registers the prefixed form
      unconditionally, so renaming to `mem` overwrites a `claude-mem` CLI in that shell.
-   - Another account's bare launcher — if an account named `claude-foo` exists, renaming
-     to `foo` makes both want the name `claude-foo`. `Get-ChildItem` is alphabetical, so
-     `.claude-foo` is registered last and wins, and typing `claude-foo` silently opens the
-     wrong account. Equivalent to rejecting `<new>` when an account named `claude-<new>`
-     exists.
+     Expressed as: a command named `claude-<new>` exists and `Test-OurLauncher` says it is
+     not ours.
+   - **Another account's bare launcher** — if an account named `claude-foo` exists,
+     renaming to `foo` makes both want the name `claude-foo`. `Get-ChildItem` is
+     alphabetical, so `.claude-foo` is registered last and wins, and typing `claude-foo`
+     silently opens the wrong account. Expressed as: **`~/.claude-claude-<new>` exists** —
+     a directory test, checked with `-LiteralPath`.
+
+   `Test-OurLauncher` cannot express the second case, and this is the trap: that launcher's
+   body _does_ contain `Use-ClaudeAccount`, so the predicate answers "ours" and the guard
+   passes while the collision ships. The predicate answers "is this ours?"; the guard is
+   asking "will this collide?". Those two answers diverge precisely when the colliding
+   command is one of ours — the case the guard exists for.
 
    This guard contains the hazard within rename rather than changing
    `Register-ClaudeAccountFunctions`' unconditional registration, which would give a
-   colliding account *no* launcher at all — worse than the current behaviour and a change
+   colliding account _no_ launcher at all — worse than the current behaviour and a change
    affecting accounts this feature never touches.
 
 ### Name validation
 
-The invalid-name class is `[\\/:*?"<>|\[\]]` — the regex literal. Two things beyond the
-existing rule:
+The invalid-name class is `[\\/:*?"<>|\[\]]` — the regex literal. Exactly **one** character
+class is added beyond the existing rule:
 
-- **The doubled backslash.** `[\/…]` compiles to an escaped forward slash and admits
-  `..\evil`. The severity is bounded — `Rename-Item -NewName` rejects path-bearing names
-  outright, so this never produced traversal — but it converts a clean guard rejection
-  into a late failure after the `ShouldProcess` prompt, carrying an error message about
-  paths and devices. The observable difference is *which error the user sees and when*,
-  and the test asserts that, not merely that the rename was refused.
-- **Brackets.** These are the genuinely dangerous addition. A bracketed name passes every
-  other guard, renames successfully, is matched by `Get-ClaudeAccountDir`, and then
-  receives **no launchers at all** while the success path reports success — with no way
-  back except renaming by hand in Explorer, since the removal calls no-op too.
+- **Brackets.** A bracketed name passes every other guard, renames successfully, is
+  matched by `Get-ClaudeAccountDir`, and then receives **no launchers at all** while the
+  success path reports success — with no way back except renaming by hand in Explorer,
+  since the removal calls no-op too. This is the whole reason the class is being touched.
+
+The backslash needs no change: `setup-claude-accounts.ps1:62` already reads
+`'[\\/:*?"<>|]'` and already rejects `..\evil` (verified — see Findings). The `..\evil`
+test case is retained as a **regression test against future simplification** of the class,
+not as coverage for a present bug; it asserts the guard's own message so that a later edit
+collapsing `\\` to `\` fails loudly rather than degrading into `Rename-Item`'s late "path
+or device name" error.
 
 This class and the whitespace/trailing-dot rule apply to **both** `Rename-ClaudeAccount`
 and `setup-claude-accounts.ps1`. Validating only on rename would let setup manufacture the
 exact names rename exists to prevent, and would make the cross-reference comment claim a
-parity that does not hold. Tightening setup rejects names it previously accepted; that is
-a deliberate behaviour change, listed under Scope.
+parity that does not hold.
+
+The behaviour change to setup is therefore **narrower than an earlier draft of this design
+stated**: setup begins rejecting bracketed names and names with leading/trailing whitespace
+or a trailing dot. It rejects nothing else it previously accepted, and the README note must
+say so rather than implying a broader tightening.
 
 ### ShouldProcess gate
 
@@ -153,6 +206,33 @@ if (-not $PSCmdlet.ShouldProcess($src, "Rename to .claude-$NewName")) { return }
 preference propagation, but assigning `$env:CLAUDE_CONFIG_DIR` and writing a success
 message do not. Verified: with no gate, `-WhatIf` left the directory unrenamed while
 mutating the variable and printing "renamed successfully".
+
+### Before the rename: decide whether this shell is affected
+
+**The `CLAUDE_CONFIG_DIR` comparison must be computed before `Rename-Item` runs, and only
+the assignment deferred until after.** Once the rename succeeds the old path no longer
+exists, and `Resolve-Path` on a missing path throws rather than returning anything to
+compare — so a comparison scheduled "after a successful rename" can never succeed. An
+earlier draft of this design placed it there, with the effect that the fallback below
+would fire for _every_ shell sitting on the renamed account: the common case, silently
+downgraded from a repoint to a reset.
+
+So, before renaming, record a boolean:
+
+- Compare **resolved** paths, not the raw string against a reconstructed
+  `Join-Path $HOME ...`. A variable exported by hand as `%USERPROFILE%\.claude-work\`, or
+  via a UNC or mapped drive, or on a machine where `$HOME` and `$env:USERPROFILE` differ,
+  compares unequal and would be left pointing at a directory that no longer exists — the
+  exact outcome this step exists to prevent.
+- **Trim trailing separators on both sides.** Resolution alone is not normalisation:
+  `Resolve-Path '<dir>\'` returns the trailing backslash intact and compares unequal to
+  the same directory resolved without one, and `(Get-Item ...).FullName` is identical in
+  this respect. Only `.TrimEnd('\','/')` on both operands makes them match. Without it the
+  trailing-separator case in test 4 fails — the very case added to prove the comparison
+  resolves paths.
+- If `$env:CLAUDE_CONFIG_DIR` is set but does not resolve _before_ the rename, it was
+  already dangling; treat that as "not this account" and leave it alone. Resetting someone
+  else's broken variable is not this command's job.
 
 ### The rename
 
@@ -171,13 +251,9 @@ Phantom accounts about what happens if a session is live.
 
 - Call `Unregister-ClaudeAccountLaunchers -Name <old>` (see Reuse).
 - Call `Register-ClaudeAccountFunctions` to generate the new launchers.
-- Repoint `$env:CLAUDE_CONFIG_DIR` if this shell was on the renamed account. Compare
-  **resolved** paths, not the raw string against a reconstructed `Join-Path $HOME ...`.
-  A variable exported by hand as `%USERPROFILE%\.claude-work\`, or via a UNC or mapped
-  drive, or on a machine where `$HOME` and `$env:USERPROFILE` differ, compares unequal and
-  would be left pointing at a directory that no longer exists — the exact outcome this
-  step exists to prevent. If the current value no longer resolves after the rename, fall
-  back to `Reset-ClaudeAccount`, as `Remove-ClaudeAccount` does.
+- If the boolean recorded above is true, set `$env:CLAUDE_CONFIG_DIR` to the new directory.
+  As a belt-and-braces check, if the value in hand still fails to resolve after that
+  assignment, fall back to `Reset-ClaudeAccount`, as `Remove-ClaudeAccount` does.
 - Report success, **naming the launchers that actually exist**. The bare launcher is
   skipped when it would shadow an existing command, and only via `Write-Verbose` —
   invisible by default. A flat "renamed" leaves the user typing a name that belongs to
@@ -204,8 +280,16 @@ Set-Item -LiteralPath "function:global:claude-$name" -Value $body
   already create.
 - **`-LiteralPath` on every `function:` call**, and removals must use the
   `function:<name>` form without the `global:` prefix, which defeats removal even with
-  `-LiteralPath`. Guard 3 rejects bracket names going forward, but existing installs may
+  `-LiteralPath`. Dropping the prefix is safe from inside a helper function (verified —
+  see Findings). Guard 3 rejects bracket names going forward, but existing installs may
   already have one, and the `-Path` forms fail silently rather than loudly.
+- **No launcher _lookup_ may go through `Get-Command -Name`.** Same wildcard defect on the
+  read side: `Get-Command -Name 'a[1]'` does not find a function genuinely named `a[1]`,
+  so a bracket-named launcher reads as absent and as _not ours_, and the removal that
+  `-LiteralPath` just made possible never gets called. Lookups use
+  `Get-Item -LiteralPath "function:<name>"`, or drive enumeration compared with `-eq`.
+  This applies to `Test-OurLauncher` and to the shadow check already inline in
+  `Register-ClaudeAccountFunctions`.
 
 **Considered: making `Use-ClaudeAccount` throw instead.** Moving the fail-fast into
 `Use-ClaudeAccount` so every caller inherits it. Rejected: the launcher body is generated
@@ -262,6 +346,13 @@ and its definition matches `Use-ClaudeAccount`", currently inline in `Remove-Cla
 and `Register-ClaudeAccountFunctions`, and needed by guard 8 and the success report. All
 call sites are in the same file.
 
+Its lookup uses `Get-Item -LiteralPath "function:<name>"` (or drive enumeration with `-eq`),
+**not** `Get-Command -Name` — the inline versions it replaces both use the latter, and
+carrying that forward would reintroduce the wildcard defect into the one helper every
+bracket-name fix routes through. Note the extracted predicate answers _"is this ours?"_ and
+nothing else; guard 8's second case needs a directory test instead, for the reason given
+there.
+
 **The invalid-name class stays duplicated between the two files**, deliberately, now that
 both enforce it. Sharing the constant would force `setup-claude-accounts.ps1` to
 dot-source the profile — which executes `Register-ClaudeAccountFunctions` at load. That
@@ -287,7 +378,7 @@ not `TestDrive:`, because `mklink /J` cannot resolve a PSDrive path. Each test b
 account dir with a `projects` junction into a fake shared store holding a sentinel file.
 
 **No test may delete a fixture account directory with a plain `Remove-Item -Recurse`.**
-Junctions are unlinked with `cmd /c rmdir` first, in teardown *and* mid-test. On
+Junctions are unlinked with `cmd /c rmdir` first, in teardown _and_ mid-test. On
 PowerShell 5.1 the recursion follows the junction and deletes the shared store's contents,
 taking the sentinel with it — after which case 2 passes vacuously or fails spuriously for
 every test ordered after the offender, and ordering is not pinned.
@@ -304,20 +395,32 @@ Cases:
    - source is a `.claude-*` directory with no `projects/` — fixture creates a fake
      `.claude-mem` — and the error names the missing `projects/` entry rather than
      claiming the directory does not exist
-   - source does not exist at all
-   - destination contains `..\evil` — asserting the *guard's* message, not merely that the
+   - source does not exist at all, asserting the **other** message ("No such account") and
+     specifically _not_ the `projects/` wording. These two bullets are a pair: together
+     they pin the split in guard 2, and either one alone passes against a single
+     catch-all message
+   - destination contains `..\evil` — asserting the _guard's_ message, not merely that the
      rename was refused, since `Rename-Item` rejects path-bearing names anyway and a
-     refusal alone passes with the buggy regex too
+     refusal alone would also pass if the class were later weakened to `[\/…]`. This is a
+     regression test against future simplification, not coverage of a present bug
    - destination contains brackets — `a[1]`
    - destination has trailing whitespace or a trailing dot
    - destination is `shared`
    - same name, including the case-only `work` → `Work`
    - destination already exists
-   - `claude-<new>` would collide (guard 8), covering both an external command and an
-     account named `claude-<new>`
+   - `claude-<new>` would collide (guard 8) — **two separate tests**, since the guard is
+     two checks: one where a foreign command named `claude-<new>` exists (fixture registers
+     a stub whose body lacks `Use-ClaudeAccount`), and one where a _real fixture account
+     directory_ `.claude-claude-<new>` exists. The second is the one that passes
+     incorrectly if the guard is built on `Test-OurLauncher` alone, because that account's
+     own bare launcher reads as ours
 4. `$env:CLAUDE_CONFIG_DIR` is repointed when this shell was on the renamed account, and
    left untouched when it was on a different one. Includes a non-canonical spelling of the
-   old path — trailing separator — to prove the comparison resolves paths
+   old path — trailing separator — to prove the comparison both resolves paths _and_
+   normalises the separator. This case fails against `Resolve-Path` alone; it passes only
+   with the `.TrimEnd('\','/')` on both operands. Also asserts the repoint still happens
+   when the variable is set, since the comparison is computed before the rename and a
+   naive post-rename implementation resets instead
 5. A bare launcher whose name collides with a non-ours command is not removed
 6. `-WhatIf` changes nothing — directory not renamed, `$env:CLAUDE_CONFIG_DIR` unchanged,
    no success output. The env-var assertion is the one that fails without the gate
@@ -333,9 +436,32 @@ Cases:
    a real external command like `git` — a machine or CI image without git would invert
    every assertion in this case, and whether git resolves as an Application or an alias
    would change its meaning
+10. `Test-OurLauncher` and `Unregister-ClaudeAccountLaunchers` handle a bracket-named
+    launcher. Create `function:global:claude-a[1]` with `Set-Item -LiteralPath`, assert
+    `Test-OurLauncher 'claude-a[1]'` returns true, then assert
+    `Unregister-ClaudeAccountLaunchers -Name 'a[1]'` actually removes it — checked by
+    enumerating the `function:` drive and comparing with `-eq`, never by `Get-Command
+-Name`, which cannot see the function it is asked about. Guard 3 blocks new bracket
+    names, so this covers the install that already has one. Both assertions pass
+    vacuously if the test itself looks the name up with `Get-Command -Name`
+
+**A second file, `tests/Set-ClaudeAccountName.Tests.ps1`**, covers the name class in
+`setup-claude-accounts.ps1`. It is the only user-visible tightening this change makes to a
+script people already run, and the rename tests do not touch it — they exercise a different
+file's copy of the constant. Invoked as a script with `-DryRun` so nothing is created:
+
+11. `-Accounts 'a[1]'` throws the invalid-name error, as do a trailing dot, leading and
+    trailing whitespace, and each pre-existing member of the class (`a\b`, `a/b`, `a:b`)
+12. `-Accounts 'work','o''clock'` is accepted — the apostrophe is deliberately _not_
+    guarded, since doubling in the launcher body is a complete fix, and a test pins that
+    decision so a later "tighten the class" edit has to argue with it
+13. The two files' class literals are identical. Both are extracted by regex from source
+    and compared, so the deliberate duplication cannot silently drift — this is the check
+    that replaces the shared constant rejected under Reuse
 
 Teardown restores `$HOME`, unlinks fixture junctions, deletes the fake home directory, and
-removes the `function:global:` entries the tests generated.
+removes the `function:global:` entries the tests generated — the bracket-named ones via
+`Remove-Item -LiteralPath "function:<name>"`, since the `global:` form no-ops on them.
 
 ## Documentation
 
@@ -352,7 +478,11 @@ README:
   to an existing command — a script calling `claude-work` will now abort rather than
   continue — and shipping it unannounced is exactly the "breaking change without warning"
   the project's guidelines forbid
-- A note that `setup-claude-accounts.ps1` now rejects account names it previously accepted
+- A note that `setup-claude-accounts.ps1` now rejects account names it previously
+  accepted, **naming them**: names containing `[` or `]`, and names with leading or
+  trailing whitespace or a trailing dot. Nothing else changes — path characters were
+  already rejected. A vaguer "now rejects some names" would send users auditing account
+  names that were never at risk
 - A Testing section with the Pester 5 prerequisite and the run command
 
 `claude-account-profile.ps1` header comment: add `Rename-ClaudeAccount` to the command
@@ -364,14 +494,17 @@ requires a new shell.
 In scope, beyond the new function:
 
 - `Register-ClaudeAccountFunctions` — launcher body (`-ErrorAction Stop`, apostrophe
-  doubling) and `-LiteralPath` on the `function:` calls. **Alters behaviour**: launchers
-  now fail terminating.
+  doubling), `-LiteralPath` on the `function:` writes, and the inline shadow check moved
+  off `Get-Command -Name`. **Alters behaviour**: launchers now fail terminating.
 - `Remove-ClaudeAccount` — call the extracted helpers; removals switch to the
   `function:<name>` form. **Fixes a silent no-op** on bracket-named launchers.
-- `setup-claude-accounts.ps1` — the shared invalid-name class plus the whitespace and
-  trailing-dot rule. **Alters behaviour**: rejects names it previously accepted.
+- `setup-claude-accounts.ps1` — brackets added to the invalid-name class, plus the
+  whitespace and trailing-dot rule. **Alters behaviour**: rejects bracketed names and
+  names with edge whitespace or a trailing dot. The backslash in the existing class is
+  already correct and is not touched.
 - New helpers `Test-OurLauncher` and `Unregister-ClaudeAccountLaunchers`.
 - README and the profile header comment.
+- `tests/Rename-ClaudeAccount.Tests.ps1` and `tests/Set-ClaudeAccountName.Tests.ps1`.
 
 Out of scope:
 
@@ -386,3 +519,37 @@ Out of scope:
   registered. Worth doing — it would let `setup-claude-accounts.ps1` give the same
   accurate "then run `claude-<name>`" advice — but it changes an existing function's
   signature for a benefit rename gets from `Test-OurLauncher` alone.
+
+## Corrections applied
+
+Six defects found re-verifying the 2026-08-11 draft against the source files and a live
+PowerShell 5.1 session. All the draft's original findings reproduced exactly — brackets on
+the `function:` provider, the apostrophe throw, `SupportsShouldProcess` without a
+`ShouldProcess` call, `-ErrorAction Stop`, `Rename-Item -NewName`, trailing-dot
+normalisation — so what follows is a correction of the _reasoning built on top of them_,
+not of the findings themselves.
+
+1. **The doubled-backslash fix was fictional.** `setup-claude-accounts.ps1:62` already
+   reads `'[\\/:*?"<>|]'` and already rejects `..\evil`. Brackets are the only genuine
+   addition. Corrected in Findings, Name validation, Tests and Scope; the README note now
+   names the newly rejected characters instead of implying a broad tightening.
+2. **`Resolve-Path` does not normalise a trailing separator**, so test case 4 — added
+   specifically to prove the path comparison works — failed against the mechanism the
+   draft prescribed. `.TrimEnd('\','/')` on both operands is now required explicitly.
+3. **The `CLAUDE_CONFIG_DIR` comparison was scheduled after the rename**, where the old
+   path no longer resolves and `Resolve-Path` throws. Every affected shell would have hit
+   the `Reset-ClaudeAccount` fallback. Split into a new "Before the rename" step.
+4. **`Test-OurLauncher` inherited the wildcard defect** it was meant to route around:
+   `Get-Command -Name 'a[1]'` cannot see a function named `a[1]`, so bracket-named
+   launchers read as _not ours_ and never get removed — the exact case `-LiteralPath` was
+   added to fix. Lookups now go through `Get-Item -LiteralPath` or drive enumeration.
+5. **Guard 8 could not be built on `Test-OurLauncher`.** A colliding account's own bare
+   launcher _is_ ours, so the predicate returns true and the guard passes. Restated as two
+   independent checks, one of them a directory test.
+6. **Guard 2's single error message contradicted its own test cases** — the `projects/`
+   wording asserts a directory exists, which is false for a mistyped name. Split into two
+   messages selected by `Test-Path`, with a paired test.
+
+Two gaps also closed: `setup-claude-accounts.ps1`'s tightened validation had no tests
+despite being the only breaking change to a script users already run, and nothing pinned
+the deliberately duplicated name class against drift.
