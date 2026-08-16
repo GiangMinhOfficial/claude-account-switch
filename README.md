@@ -1,7 +1,8 @@
 # claude-account-switch
 
 Run multiple Claude Code accounts on Windows. Each account keeps its own login;
-all accounts share one set of session transcripts, skills, agents and plugins.
+all accounts share one set of session transcripts, skills, agents, plugins and
+one global `CLAUDE.md`.
 
 No admin rights. Nothing is ever deleted from your existing `~/.claude`.
 
@@ -26,28 +27,44 @@ follows the config dir:
 | `.credentials.json` | `join(configDir, ".credentials.json")`                 | yes                  |
 | `.claude.json`      | `join(CLAUDE_CONFIG_DIR \|\| homedir, ".claude.json")` | yes                  |
 | `projects/`         | `join(configDir, "projects")`                          | yes                  |
+| `CLAUDE.md`         | `join(configDir, "CLAUDE.md")`                         | yes                  |
 
 Because `projects/` is isolated too, accounts would not see each other's history.
 So the directories that _should_ be common live once in `~/.claude-shared` and are
 exposed to every account through an NTFS **directory junction** — one copy of truth,
 no syncing, no divergence.
 
+`CLAUDE.md` — your global memory — follows the config dir in exactly the same way,
+but it is a _file_, and a junction only links directories. It gets an NTFS
+**hardlink** instead: the real file stays in `~/.claude`, and the store and every
+account hold additional names for that same inode. Editing it from any account
+edits it for all of them, because there is only one of it.
+
 ```
-~/.claude-shared/          <- the single real copy
+~/.claude/                 <- the default config dir, still a working fallback
+    CLAUDE.md              <- the real global memory file lives here
+
+~/.claude-shared/          <- the single real copy of everything else
     projects/  skills/  agents/  commands/  hooks/  plugins/  get-shit-done/
+    CLAUDE.md -> another name for ~/.claude/CLAUDE.md   (hardlink)
     bin/claude-account-profile.ps1        (installed by install.ps1)
 
-~/.claude-work/            <- account: private login + junctions
+~/.claude-work/            <- account: private login + links
     .credentials.json      (private)
     .claude.json           (private)
     settings.json          (private)
     sessions/  history.jsonl  cache/ ...   (private)
     projects/ -> ~/.claude-shared/projects        (junction)
     skills/   -> ~/.claude-shared/skills          (junction)
+    CLAUDE.md -> the same inode as ~/.claude/CLAUDE.md   (hardlink)
     ...
 
 ~/.claude-personal/        <- same shape, different login
 ```
+
+A hardlink has no "original": every name for the file is equal, and deleting one
+name never touches the content behind the others. That is why `~/.claude` can keep
+the file while every account still reads and writes it.
 
 ---
 
@@ -55,7 +72,10 @@ no syncing, no divergence.
 
 - Windows, PowerShell 5.1 or later
 - Claude Code installed and on `PATH`
-- No administrator rights (junctions via `mklink /J`, unlike real symlinks)
+- No administrator rights (junctions via `mklink /J` and hardlinks via `mklink /H`,
+  unlike real symlinks — which is why neither mechanism here is a symlink)
+- NTFS, with `~/.claude`, `~/.claude-shared` and the accounts on one volume. A
+  hardlink cannot cross volumes; junctions can, but nothing here needs them to.
 
 ---
 
@@ -115,7 +135,7 @@ That is the whole setup. `/login` uses the normal OAuth flow.
 | `claude-work`                        | Launch Claude Code as `work` (args pass through: `claude-work --resume`) |
 | `claude-personal`                    | Launch Claude Code as `personal`                                         |
 | `Use-ClaudeAccount work`             | Point this shell at `work` **without** launching                         |
-| `Get-ClaudeAccount`                  | Show the current account, list all accounts, flag any not logged in      |
+| `Get-ClaudeAccount`                  | Show the current account, list all accounts, flag any not logged in or no longer sharing `CLAUDE.md` |
 | `Reset-ClaudeAccount`                | Return this shell to the default `~/.claude`                             |
 | `Remove-ClaudeAccount personal`      | Delete an account safely (see warning below)                             |
 | `Rename-ClaudeAccount personal work` | Rename an account and its launchers (see below)                          |
@@ -156,6 +176,54 @@ the local transcript and continues under whichever credentials are active.
 
 **Do not resume the same session from two accounts at once** — two processes
 appending to one `.jsonl` will interleave.
+
+---
+
+## One global CLAUDE.md for every account
+
+Claude Code reads global memory from `<configDir>/CLAUDE.md`, so without this each
+account would have its own — and `/memory` on a fresh account opens an empty file
+rather than the instructions you wrote.
+
+Setup hardlinks it, so all of these are one file:
+
+```
+~/.claude/CLAUDE.md              <- the real file
+~/.claude-shared/CLAUDE.md       <- another name for it
+~/.claude-work/CLAUDE.md         <- another name for it
+~/.claude-personal/CLAUDE.md     <- another name for it
+```
+
+`/memory` from any account edits the shared content directly. So does an editor, a
+`git checkout`, or anything else that writes to the path — there is no sync step
+and no "primary" copy to remember.
+
+To apply this to accounts that already exist, re-run setup for them. Nothing is
+re-seeded and existing junctions are left alone:
+
+```powershell
+.\setup-claude-accounts.ps1 -Accounts work,personal -NoSeed
+```
+
+Setup will not silently discard memory an account already wrote. It replaces the
+account's `CLAUDE.md` only when the file is empty, or is byte-for-byte identical to
+the shared one; anything else stops the run with `Refusing to overwrite`, so you can
+merge it into the shared file yourself and re-run.
+
+To keep an account's memory private, drop `CLAUDE.md` from `-SharedFiles`:
+
+```powershell
+.\setup-claude-accounts.ps1 -Accounts client -NoSeed -SharedFiles @()
+```
+
+`-SharedFiles` takes any list of plain file names at the top of the config dir, so
+the same mechanism shares anything else that is not a directory.
+
+> **One caveat, and it is the reason `Get-ClaudeAccount` checks.** Some editors save
+> by writing a new file and renaming it over the old one. That replaces the link with
+> an ordinary file, and the account quietly stops following the shared memory while
+> still showing a perfectly readable `CLAUDE.md`. `Get-ClaudeAccount` marks such an
+> account `CLAUDE.md not shared`; re-running setup relinks it.
 
 ---
 
@@ -218,8 +286,11 @@ Three things to know:
 
 ## Safety notes
 
-- **Your original `~/.claude` is never modified.** Setup only reads from it. It stays
-  as a working fallback: any shell without `CLAUDE_CONFIG_DIR` set uses it.
+- **Nothing in your original `~/.claude` is changed or removed.** Setup only reads
+  from it. It stays as a working fallback: any shell without `CLAUDE_CONFIG_DIR` set
+  uses it. The one thing setup can _add_ there is an empty `CLAUDE.md`, and only if
+  you have none at all — a hardlink needs a real file to be a second name for, and
+  `~/.claude` is where that file belongs. Setup says so when it does this.
 - **That fallback is also the main gotcha.** A plain `claude` in a fresh shell writes
   sessions to `~/.claude/projects`, which is _not_ the shared store — those sessions
   will not appear on your accounts. Launch through `claude-<name>` to stay consistent.
@@ -228,7 +299,12 @@ Three things to know:
   one leak exposes several accounts. Keep them out of any backup or cloud-sync folder.
 - **Shared history is shared in both directions.** If one account is an employer's,
   its transcripts are visible from your personal account and vice versa. To keep a
-  particular account separate, remove `projects` from `-SharedDirs` for it.
+  particular account separate, remove `projects` from `-SharedDirs` for it — and
+  `CLAUDE.md` from `-SharedFiles`, which is shared in both directions for the same
+  reason.
+- **`Remove-ClaudeAccount` needs no special care for the hardlink.** A hardlink is
+  not a reparse point, so it is not in the unlink pass — and it does not need to be.
+  Deleting one name for a file never touches the content behind the other names.
 - **`claude-<name>` now fails instead of falling back.** Previously, launching an
   account whose directory was missing printed an error and then started Claude Code
   anyway, under whatever config dir the shell held — dropping you into the wrong
@@ -301,6 +377,34 @@ Move-Item ~\.claude-work\projects ~\.claude-work\projects.bak
 **An account shows `(not logged in)` in `Get-ClaudeAccount`**
 
 It has no `.credentials.json` yet. Run `claude-<name>` and then `/login`.
+
+**An account shows `(CLAUDE.md not shared)`**
+
+Its `CLAUDE.md` is an ordinary file again — usually because an editor saved it by
+writing a new file and renaming it over the link. Anything written to it since is in
+that file only. Merge what you want to keep into `~/.claude/CLAUDE.md`, then relink:
+
+```powershell
+Remove-Item ~\.claude-work\CLAUDE.md          # only after merging
+.\setup-claude-accounts.ps1 -Accounts work -NoSeed
+```
+
+Setup relinks an empty or byte-identical file on its own, so if you have not touched
+the account's copy, the re-run alone is enough.
+
+**`Refusing to overwrite ...\CLAUDE.md`**
+
+That account wrote memory of its own before `CLAUDE.md` was shared, and setup will
+not decide for you which version wins. Merge it into `~/.claude/CLAUDE.md`, delete
+the account's copy, and re-run.
+
+**Checking the shared file by hand**
+
+`Target` lists the file's other names. Every account should appear in it:
+
+```powershell
+Get-Item ~\.claude\CLAUDE.md -Force | Select-Object LinkType, Target
+```
 
 **Sessions from one account are missing on another**
 

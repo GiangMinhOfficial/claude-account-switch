@@ -47,6 +47,38 @@ function Use-ClaudeAccount {
     Write-Host "claude account: $Name" -ForegroundColor Cyan
 }
 
+function Test-ClaudeSharedMemory {
+    # Is this account's CLAUDE.md the same file as the shared one? Hardlinks
+    # are symmetric - every name for an inode is an equal name, with no
+    # "original" among them - so FileInfo.Target lists all the OTHER names, and
+    # the shared store's name is what we look for there.
+    #
+    # setup-claude-accounts.ps1 has its own, fuller version of this test. The
+    # duplication is deliberate: dot-sourcing that script from here would run a
+    # whole setup routine every time a shell opens.
+    param([Parameter(Mandatory = $true)][string] $AccountDir)
+
+    $link   = Join-Path $AccountDir 'CLAUDE.md'
+    $shared = Join-Path $HOME '.claude-shared\CLAUDE.md'
+    if (-not (Test-Path -LiteralPath $link -PathType Leaf)) { return $false }
+    if (-not (Test-Path -LiteralPath $shared -PathType Leaf)) { return $false }
+
+    $item = Get-Item -LiteralPath $link -Force
+    if ($item.LinkType -ne 'HardLink') { return $false }
+
+    $sharedFull = (Get-Item -LiteralPath $shared -Force).FullName
+    foreach ($peer in @($item.Target)) {
+        if ([string]::IsNullOrWhiteSpace($peer)) { continue }
+        # Peers can arrive volume-relative. A hardlink cannot cross volumes, so
+        # the link's own drive is always the one to put back.
+        if ($peer -notmatch '^[A-Za-z]:\\' -and $peer -notmatch '^\\\\') {
+            $peer = (Split-Path -Qualifier $item.FullName) + $peer
+        }
+        if ($peer -eq $sharedFull) { return $true }
+    }
+    return $false
+}
+
 function Get-ClaudeAccount {
     if ([string]::IsNullOrEmpty($env:CLAUDE_CONFIG_DIR)) {
         Write-Host "current: (default) $(Join-Path $HOME '.claude')" -ForegroundColor DarkGray
@@ -55,11 +87,28 @@ function Get-ClaudeAccount {
         Write-Host "current: $name  ->  $env:CLAUDE_CONFIG_DIR" -ForegroundColor Cyan
     }
 
+    # Only worth reporting on when shared memory is set up at all. Without this
+    # gate, anyone who left CLAUDE.md out of -SharedFiles gets every account
+    # flagged for a thing they chose.
+    $memoryIsShared = Test-Path -LiteralPath (Join-Path $HOME '.claude-shared\CLAUDE.md') -PathType Leaf
+
     Write-Host "available:"
     Get-ClaudeAccountDir | ForEach-Object {
         $n = $_.Name -replace '^\.claude-', ''
-        $loggedIn = Test-Path -LiteralPath (Join-Path $_.FullName '.credentials.json')
-        if ($loggedIn) { $tag = '' } else { $tag = '  (not logged in)' }
+
+        $tags = @()
+        if (-not (Test-Path -LiteralPath (Join-Path $_.FullName '.credentials.json'))) {
+            $tags += 'not logged in'
+        }
+        # An editor that saves by writing a new file and renaming it over the
+        # old one breaks the hardlink, and nothing else would ever say so: the
+        # account keeps a perfectly good CLAUDE.md that no longer follows the
+        # shared one. Re-run setup-claude-accounts.ps1 to relink.
+        if ($memoryIsShared -and -not (Test-ClaudeSharedMemory -AccountDir $_.FullName)) {
+            $tags += 'CLAUDE.md not shared'
+        }
+
+        if ($tags.Count -gt 0) { $tag = "  ($($tags -join ', '))" } else { $tag = '' }
         Write-Host ("  $n$tag")
     }
 }
@@ -119,6 +168,10 @@ function Unregister-ClaudeAccountLaunchers {
 function Remove-ClaudeAccount {
     # Deletes one account. Never use plain Remove-Item -Recurse on an account
     # dir: it can follow the junctions and delete the SHARED store behind them.
+    #
+    # The account's hardlinked CLAUDE.md needs no such care and is deliberately
+    # not in the unlink loop below - a hardlink is not a reparse point, and
+    # deleting one name for an inode never touches the others.
     [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
     param([Parameter(Mandatory = $true)][string] $Name)
 
