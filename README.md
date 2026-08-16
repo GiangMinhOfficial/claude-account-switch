@@ -28,6 +28,7 @@ follows the config dir:
 | `.claude.json`      | `join(CLAUDE_CONFIG_DIR \|\| homedir, ".claude.json")` | yes                  |
 | `projects/`         | `join(configDir, "projects")`                          | yes                  |
 | `CLAUDE.md`         | `join(configDir, "CLAUDE.md")`                         | yes                  |
+| `settings.json`     | `join(configDir, "settings.json")`                     | yes                  |
 
 Because `projects/` is isolated too, accounts would not see each other's history.
 So the directories that _should_ be common live once in `~/.claude-shared` and are
@@ -40,19 +41,26 @@ but it is a _file_, and a junction only links directories. It gets an NTFS
 account hold additional names for that same inode. Editing it from any account
 edits it for all of them, because there is only one of it.
 
+The status line needs no link at all. `settings.json` stays private per account —
+each has its own model, theme and hooks — but the one key that should not differ,
+`statusLine`, names a **path**. So one copy of `statusline.sh` lives in the store
+and setup points every account's `settings.json` at that copy.
+
 ```
 ~/.claude/                 <- the default config dir, still a working fallback
     CLAUDE.md              <- the real global memory file lives here
+    settings.json          (private, but its statusLine points at the store)
 
 ~/.claude-shared/          <- the single real copy of everything else
-    projects/  skills/  agents/  commands/  hooks/  plugins/  get-shit-done/
+    projects/  skills/  agents/  commands/  hooks/  plugins/
     CLAUDE.md -> another name for ~/.claude/CLAUDE.md   (hardlink)
+    statusline.sh          <- the one status line script, run by every account
     bin/claude-account-profile.ps1        (installed by install.ps1)
 
 ~/.claude-work/            <- account: private login + links
     .credentials.json      (private)
     .claude.json           (private)
-    settings.json          (private)
+    settings.json          (private, but its statusLine points at the store)
     sessions/  history.jsonl  cache/ ...   (private)
     projects/ -> ~/.claude-shared/projects        (junction)
     skills/   -> ~/.claude-shared/skills          (junction)
@@ -76,6 +84,10 @@ the file while every account still reads and writes it.
   unlike real symlinks — which is why neither mechanism here is a symlink)
 - NTFS, with `~/.claude`, `~/.claude-shared` and the accounts on one volume. A
   hardlink cannot cross volumes; junctions can, but nothing here needs them to.
+- For the shared status line only: **Git Bash** and **Node.js**, which is what
+  `statusline.sh` runs on. Setup finds them itself and skips the status line with a
+  warning if either is missing; everything else works without them. Pass
+  `-NoStatusLine` to skip it deliberately.
 
 ---
 
@@ -227,6 +239,58 @@ the same mechanism shares anything else that is not a directory.
 
 ---
 
+## One status line for every account
+
+`statusline.sh` renders the bar at the bottom of Claude Code:
+
+```
+minhgh | Opus 5 (high) | main | ●●●○○○○○○○ 62k/200k (31%) | 5h 12% (02:39 PM) · Wk 40% (Aug 21, 04:00 PM)
+```
+
+The first segment is the account. The script derives it from `CLAUDE_CONFIG_DIR` at
+run time (`.claude-work` → `work`, unset → `default`), which is what lets a single
+script serve every account: it labels itself correctly wherever it runs.
+
+Setup copies it to `~/.claude-shared/statusline.sh` and writes the `statusLine` key
+of every account's `settings.json` — plus `~/.claude`'s, because that file is the
+template each new account is seeded from:
+
+```json
+"statusLine": {
+  "type": "command",
+  "command": "\"C:/Program Files/Git/bin/bash.exe\" \"C:/Users/you/.claude-shared/statusline.sh\""
+}
+```
+
+Git Bash is located by asking where `git` is, not by looking for `bash` on `PATH`:
+with WSL installed, `bash` is `C:\Windows\System32\bash.exe`, which starts a Linux
+VM that cannot open a `C:/Users/...` path — the bar would silently render nothing.
+
+Applying it to accounts that already exist is the same re-run as everything else:
+
+```powershell
+.\setup-claude-accounts.ps1 -Accounts work,personal -NoSeed
+```
+
+Nothing else in `settings.json` is touched. Only the `statusLine` key changes — key
+order, two-space indentation, LF endings and any `padding` you set inside
+`statusLine` all survive, so the diff is one line. If an account already had a
+different status line, setup replaces it and prints what it replaced, so you can put
+it back.
+
+**The store copy is a copy, not a link.** To change the bar, edit `statusline.sh` in
+this repo and re-run setup — a run overwrites the store copy whenever the two differ.
+Editing `~/.claude-shared/statusline.sh` directly works and takes effect immediately
+for every account, but the next setup run will overwrite it.
+
+To leave every `settings.json` alone:
+
+```powershell
+.\setup-claude-accounts.ps1 -Accounts work -NoSeed -NoStatusLine
+```
+
+---
+
 ## Adding and removing accounts
 
 Add:
@@ -286,11 +350,13 @@ Three things to know:
 
 ## Safety notes
 
-- **Nothing in your original `~/.claude` is changed or removed.** Setup only reads
-  from it. It stays as a working fallback: any shell without `CLAUDE_CONFIG_DIR` set
-  uses it. The one thing setup can _add_ there is an empty `CLAUDE.md`, and only if
-  you have none at all — a hardlink needs a real file to be a second name for, and
-  `~/.claude` is where that file belongs. Setup says so when it does this.
+- **Nothing in your original `~/.claude` is removed.** It stays as a working
+  fallback: any shell without `CLAUDE_CONFIG_DIR` set uses it. Setup writes there in
+  exactly two places, and says so both times. It _adds_ an empty `CLAUDE.md` if you
+  have none at all — a hardlink needs a real file to be a second name for, and
+  `~/.claude` is where that file belongs. And it _changes_ the `statusLine` key of
+  `~/.claude/settings.json`, because that file is the template new accounts are
+  seeded from; `-NoStatusLine` skips it.
 - **That fallback is also the main gotcha.** A plain `claude` in a fresh shell writes
   sessions to `~/.claude/projects`, which is _not_ the shared store — those sessions
   will not appear on your accounts. Launch through `claude-<name>` to stay consistent.
@@ -391,6 +457,31 @@ Remove-Item ~\.claude-work\CLAUDE.md          # only after merging
 
 Setup relinks an empty or byte-identical file on its own, so if you have not touched
 the account's copy, the re-run alone is enough.
+
+**`skipped - statusline.sh needs Git Bash (bash.exe) and/or Node.js (node.exe)`**
+
+Everything else was set up; only the status line was left out. Install
+[Git for Windows](https://git-scm.com/download/win) and/or [Node.js](https://nodejs.org),
+then re-run setup. Pass `-NoStatusLine` if you do not want a status line at all.
+
+**The status line is blank, or shows nothing but the model**
+
+Run the command from `settings.json` by hand to see the error:
+
+```powershell
+'{}' | & "C:\Program Files\Git\bin\bash.exe" "$HOME\.claude-shared\statusline.sh"
+```
+
+The usual causes are Node.js missing from `PATH` (the script parses its JSON input
+with `node`) and a `bash.exe` that is WSL's rather than Git's — the latter cannot
+open a Windows path and fails silently. Re-running setup rewrites the command with
+the Git Bash it finds.
+
+**`Cannot read <path>\settings.json as JSON`**
+
+That file has a syntax error — a trailing comma or a stray character from a hand
+edit. Setup refuses to rewrite a file it cannot parse, rather than replacing it with
+one holding only a status line. Fix the JSON (or delete the file) and re-run.
 
 **`Refusing to overwrite ...\CLAUDE.md`**
 

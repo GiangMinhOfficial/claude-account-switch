@@ -1,4 +1,11 @@
 # PowerShell 5.1 is happiest with CRLF; keep it stable across machines.
 *.ps1   text eol=crlf
 *.md    text eol=crlf
+
+# statusline.sh must not follow `text=auto` into CRLF on a Windows checkout.
+# Git for Windows' bash carries a patch that tolerates CR at line ends, so it
+# would survive there - but that patch is the only reason, and it is not one
+# any other bash makes.
+*.sh    text eol=lf
+
 *       text=auto
