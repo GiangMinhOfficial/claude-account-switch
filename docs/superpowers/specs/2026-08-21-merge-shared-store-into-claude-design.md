@@ -411,8 +411,11 @@ Rewrites:
 - `Rename-ClaudeAccount.Tests.ps1:93,197,224` — junction-target and store-survival
   assertions repoint to `.claude`. The `.claude-shared` exclusion test stays and now
   covers a leftover legacy store.
-- `Set-ClaudeAccountName.Tests.ps1` — the regex extraction asserting
-  `$ClaudeInvalidNameClass` is identical across files gains a third file.
+- `Set-ClaudeAccountName.Tests.ps1` — **unchanged**. An earlier draft said this test
+  would gain a third file. It should not: `migrate-shared-store.ps1` never takes an
+  account name as input, it discovers accounts from disk, so declaring
+  `$ClaudeInvalidNameClass` there would be dead code written only to satisfy a test.
+  The literal stays duplicated across exactly two files.
 
 New tests, one per defect plus the migration:
 
