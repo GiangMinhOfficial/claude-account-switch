@@ -116,8 +116,12 @@ one falsified a claim the draft had made.
 - **The forked transcript can be rescued with a two-pattern text replacement.** The id
   appears 390 times across 276 lines: 264 as top-level `sessionId`, 98 as top-level
   `session_id`, and 28 nested inside other values. All 28 nested occurrences were
-  inspected and are **file paths inside tool results** (26) and one `ls -la` listing
-  line (2) — none is in `"key":"<id>"` form. Replacing only `"sessionId":"<old>"` and
+  inspected: 26 are paths under `%LOCALAPPDATA%\Temp\claude\<project>\<id>\scratchpad`
+  and 2 are lines of an `ls -la` listing. None is in `"key":"<id>"` form, and none names
+  anything inside `~/.claude` — the scratchpad is ephemeral temp storage outside the
+  store. The legacy project directory also holds **no sibling `<id>/` directory** for
+  this transcript; it contains two `.jsonl` files and nothing else. Replacing only
+  `"sessionId":"<old>"` and
   `"session_id":"<old>"` therefore rewrites exactly the field occurrences and is
   byte-exact everywhere else. No JSON round-trip is needed, and none is wanted: PowerShell
   5.1's JSON writer re-indents and adds a BOM, and the BOM alone would make the file
@@ -159,7 +163,9 @@ Made by the user during design; recorded so the plan does not re-open them.
    concern forever.
 3. **Never overwrite, but rescue forked transcripts.** `~/.claude`'s copy wins on
    conflict; a genuinely forked `.jsonl` is additionally copied in under a fresh session
-   id so both halves are resumable.
+   id so both halves are resumable. The rule is about not losing data, so it does not
+   apply where the store's copy is a strict prefix of the legacy one — see Phase 1b,
+   where the longer file is adopted because nothing can be lost by doing so.
 4. **Accept the blast radius, and document it.** `.claude-shared` is retained as a full
    standby copy, and the docs gain an explicit warning that `~/.claude` must not be
    deleted to reset Claude Code.
@@ -188,7 +194,9 @@ Changes required beyond the path literals:
   in play **iff at least one account passes `Test-ClaudeSharedMemory`**. That is the same
   evidence the old sentinel carried, without a registry. It keeps
   `tests/SharedMemoryFile.Tests.ps1:238` and `:251` green — `work` stays linked, so the
-  gate opens and `personal` is still flagged — and preserves `:263`'s intent.
+  gate opens and `personal` is still flagged — and preserves `:263`'s intent. It is not
+  equivalent evidence in one state: when *every* account's link is broken the gate closes
+  and the diagnostic goes quiet. See Known limitations.
 - **Self-repair moves from the store to the accounts.** When a shared file is missing
   from `$Shared`, setup searches the account directories for a surviving hardlink peer
   and re-links from there before falling through to "create empty". The accounts become
@@ -213,10 +221,20 @@ Documented precondition: **close all Claude Code sessions first.** Process detec
 deliberately not implemented.
 
 **Phase 0 — discovery.** `$Legacy = ~/.claude-shared`, `$Store = ~/.claude`. Exit clean
-if `$Legacy` is absent. Accounts are discovered on disk by the same rule
-`Get-ClaudeAccountDir` uses — a `~/.claude-*` directory that is not `.claude-shared` and
-contains a `projects/` entry. This is what finds `james` and `minhgh` rather than the
-`work,personal` defaults. Refuse if `$Store` does not exist.
+if `$Legacy` is absent. Refuse if `$Store` does not exist.
+
+Accounts are discovered on disk, and migration's rule is deliberately **wider** than
+`Get-ClaudeAccountDir`'s. A `~/.claude-*` directory that is not `.claude-shared` counts
+as an account if it contains a `projects/` entry **or** any of the other five shared
+directories as a junction targeting `$Legacy`.
+
+The widening exists because Phase 2 removes a junction before recreating it: an
+interruption in that window leaves an account with no `projects/` at all, and the
+narrow rule would then skip the very account that needs repair — silently contradicting
+the re-runnable recovery this design claims. The extra clause cannot match `.claude-mem`,
+which has neither a `projects/` entry nor a junction into the legacy store.
+
+This is what finds `james` and `minhgh` rather than the `work,personal` defaults.
 
 **Phase 1 — merge, with a policy per source:**
 
@@ -231,11 +249,29 @@ contains a `projects/` entry. This is what finds `james` and `minhgh` rather tha
 **Phase 1b — conflict classification inside `projects/`.** A `.jsonl` present on both
 sides is classified before anything is written:
 
-- legacy copy is a strict line-prefix of the store's → *superseded*, skipped
-- genuinely forked → **rescued**: copied to `<newGuid>.jsonl` with only
-  `"sessionId":"<old>"` and `"session_id":"<old>"` replaced; a sibling `<old>/` directory
-  (tool results, subagents) is copied as `<newGuid>/`
+- legacy copy is a strict line-prefix of the store's → *superseded*, skipped. The store
+  already holds every line the legacy file has.
+- store copy is a strict line-prefix of the legacy's → *continued*, and the **legacy file
+  is adopted**, overwriting the store's. This is the one overwrite `projects/` permits,
+  and it is safe by construction: the file being replaced is a strict subset of the file
+  replacing it, so no line is lost. Without this case a continued session would fall
+  through to "reported only" and its extra lines would never enter the merged store.
+- neither is a prefix of the other → **genuinely forked**, and **rescued**: copied to
+  `<newGuid>.jsonl` with only `"sessionId":"<old>"` and `"session_id":"<old>"` replaced.
 - anything else that differs → the store's copy is kept and the path is reported
+
+**Sidecar directories are never renamed.** An earlier draft copied a sibling `<old>/`
+directory to `<newGuid>/`, which is incoherent: the transcript's own references to that
+path are not session-id fields and would not be rewritten, so they would point at a
+directory that no longer exists under that name. Instead the sidecar is left alone —
+Phase 1's add-if-missing pass over `projects/` already merges any sidecar files unique to
+the legacy side into the store's existing `<old>/`, so the rescued transcript's path
+references continue to resolve.
+
+The remaining nested mentions of the old id are left untouched deliberately. All 26 in
+the known fork are paths under `%LOCALAPPDATA%\Temp\claude\<project>\<id>\scratchpad` —
+ephemeral, outside `~/.claude`, and a historical record of commands that already ran.
+Rewriting them would falsify the transcript without making anything resolve.
 
 Rescued files are written with `[IO.File]::WriteAllText` and `UTF8Encoding($false)`.
 `Set-Content -Encoding utf8` on PowerShell 5.1 emits a BOM, which is the same hazard the
@@ -254,17 +290,34 @@ Removal is `cmd /c rmdir` only. `Remove-Item -Recurse` follows junctions on Powe
 trims trailing separators, because `Resolve-Path` and `FileInfo.Target` do not normalise
 them.
 
-**Phase 3 — hand off to setup.** The final step runs
-`setup-claude-accounts.ps1 -Accounts <discovered> -NoSeed`. That rewrites every
-`statusLine` from the `.claude-shared` path to the `.claude` one, re-verifies all links,
-and serves as the migration's own verification pass. Reusing setup avoids duplicating
-`Set-StatusLine`, which must stay node-written.
+**Phase 3 — hand off to setup, then re-install the profile.** The final steps run
+`setup-claude-accounts.ps1 -Accounts <discovered> -NoSeed` and then `install.ps1`. Setup
+rewrites every `statusLine` from the `.claude-shared` path to the `.claude` one,
+re-verifies all links, and serves as the migration's own verification pass. Reusing setup
+avoids duplicating `Set-StatusLine`, which must stay node-written.
 
-Order is merge → retarget → setup. Nothing is removed before its replacement exists.
+**`-DryRun` must be forwarded to both.** `-NoSeed` does not make setup inert: it would
+still copy `statusline.sh`, rewrite `settings.json` and create links. `CLAUDE.md:47`
+states that `-DryRun` writes nothing, and a migration dry run that silently performed the
+real setup would violate it.
 
-**Phase 4 — report.** Copied, skipped, superseded, rescued (old id → new id), unresolved
-conflicts, junctions retargeted, and a closing line stating that `.claude-shared` is kept
-as a full standby copy and is the user's to delete.
+`install.ps1` is not optional here. The `$PROFILE` block written by a previous install
+holds an absolute path into `.claude-shared\bin`; copying `bin/` into the store does not
+update it. Without this step a user who follows the Phase 4 guidance and deletes the
+legacy store loses every account-switching function in new shells.
+
+Order is merge → retarget → setup → install. Nothing is removed before its replacement
+exists.
+
+**Phase 4 — report.** Copied, skipped, superseded, adopted, rescued (old id → new id),
+unresolved conflicts, and junctions retargeted.
+
+The closing guidance is **conditional, not an invitation**: `.claude-shared` is kept as a
+full standby copy, and it is safe to delete only once `install.ps1` has re-run
+successfully and a *new* shell has been opened and confirmed working. Deleting it while
+`$PROFILE` still points into `.claude-shared\bin` breaks every account-switching function
+in future shells. If Phase 3 did not complete, the report says so and withholds the
+deletion guidance entirely.
 
 **Out of scope for migration:** deleting `.claude-shared`; touching `.credentials.json`
 or `.claude.json`; reconciling anything inside `plugins/` beyond Decision 5.
@@ -301,10 +354,12 @@ New tests, one per defect plus the migration:
 - the `$memoryIsShared` gate: setup with `-SharedFiles other.md` flags nothing
 - reporting honesty: the summary never claims "not modified" after `statusline.sh` was
   copied
-- migration: `-DryRun` writes nothing · a prefix-superseded `.jsonl` is skipped · a
-  forked `.jsonl` is rescued with a new id and its sibling directory · a junction is
-  retargeted from a legacy fixture · a real directory in the way is refused ·
-  `plugins/` legacy-wins
+- migration: `-DryRun` writes nothing, **including through the setup and install
+  handoffs** · a prefix-superseded `.jsonl` is skipped · a reverse-prefix `.jsonl` is
+  adopted and the store's shorter copy replaced · a forked `.jsonl` is rescued under a new
+  id with its sidecar directory left untouched · a junction is retargeted from a legacy
+  fixture · an account whose `projects/` junction is missing entirely is still discovered
+  and repaired · a real directory in the way is refused · `plugins/` legacy-wins
 
 ### 4. Docs
 
@@ -332,11 +387,25 @@ New tests, one per defect plus the migration:
 
 ## Known limitations
 
-- An account Claude Code has never run in has no `projects/`, so it is invisible to
-  account discovery and will not be migrated. This is the pre-existing limitation of the
-  whole profile, now inherited by the migration script.
+- An account Claude Code has never run in has no `projects/` and no junctions, so even
+  migration's widened discovery rule cannot see it and it will not be migrated. This is
+  the pre-existing limitation of the whole profile, now inherited by the migration script.
+
+- **The new `$memoryIsShared` gate goes quiet when *every* account's link is broken at
+  once.** The old sentinel — the existence of `.claude-shared/CLAUDE.md` — survived that
+  state and kept flagging. The replacement infers intent from the links themselves, so
+  when none survives it cannot distinguish "sharing broke everywhere" from "sharing was
+  never asked for", and reports nothing. This matters most on a single-account machine,
+  where one editor replace-on-save is enough to reach it. It is not fixable without
+  persisting sharing intent somewhere, which is the registry this architecture exists to
+  avoid: **the directory is the account**, and nothing else is a source of truth. The
+  regression is accepted as the price of that principle. Restoring the diagnostic would
+  mean adding a marker file, and that trade should be made explicitly if the quiet
+  failure is ever observed in practice.
 - The uninstall-documentation claim behind Decision 4 is unverified.
-- Migration is not transactional. It is re-runnable and never deletes, so a failed run is
-  resumed by running it again, but a run interrupted between Phase 1 and Phase 2 leaves
-  accounts pointing at the legacy store with the merge already done — harmless, and fixed
-  by re-running.
+- Migration is not transactional. It is re-runnable, and the only content it overwrites
+  is a strict subset of what replaces it, so a failed run is resumed by running it again.
+  An interruption between Phase 1 and Phase 2 leaves accounts pointing at the legacy store
+  with the merge already done — harmless. An interruption *inside* Phase 2, between
+  removing a junction and recreating it, is the one state that would otherwise be
+  unrecoverable, and is what the widened discovery rule in Phase 0 exists to catch.
