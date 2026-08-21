@@ -263,11 +263,19 @@ Phase 2 retargets that account's junctions, then Phase 3's setup reaches
 (`setup-claude-accounts.ps1:583` runs before `:587`), so the machine is left partially
 migrated and every re-run reproduces the same abort with no reconciliation path.
 
-So preflight classifies every account's `CLAUDE.md` as absent, blank, byte-identical,
-a true hardlink peer, or **divergent**. Any divergence aborts the run before a single
-byte is written, naming each offending file and telling the user to merge and delete it.
+So preflight classifies every `CLAUDE.md` as absent, blank, byte-identical, a true
+hardlink peer, or **divergent**. Any divergence aborts the run before a single byte is
+written, naming each offending file and telling the user to merge and delete it.
 Refusing before mutation is the same rule `New-FileLink` already follows; the only
 change is doing it early enough to matter.
+
+**`~/.claude-shared/CLAUDE.md` is checked too, and it is the easier copy to lose.** The
+accounts are the obvious candidates, but Phase 1 skips `CLAUDE.md` outright on the
+grounds that every name is one inode — so if the *legacy* copy has drifted into an
+independent file, its content is never merged and a clean run would go on to declare the
+legacy store safe to delete. It is also the likeliest copy to have drifted: it is the
+live shared-memory path today, so it is the one an editor has had the most opportunity to
+replace on save.
 
 **Phase 1 — merge, with a policy per source:**
 
@@ -301,7 +309,15 @@ sides is classified before anything is written:
   place, so an interrupted adoption cannot leave a half-written transcript where a valid
   one used to be.
 - neither is a prefix of the other → **genuinely forked**, and **rescued**: copied to
-  `<newGuid>.jsonl` with only `"sessionId":"<old>"` and `"session_id":"<old>"` replaced.
+  `<rescueId>.jsonl` with only `"sessionId":"<old>"` and `"session_id":"<old>"` replaced.
+
+  **The rescue id is derived, not random.** Rescuing does not resolve the fork — the
+  legacy and store copies still differ afterwards — so the next run classifies the pair as
+  forked again. With a fresh GUID each time, every re-run would write another copy of the
+  same conversation, and re-running is the documented recovery for a drift or conflict
+  abort. The id is therefore an MD5 of the old id plus the legacy file's content hash,
+  rendered as a GUID: a re-run computes the same name, finds the file already present, and
+  skips. MD5 is used as a content-addressing function here, not for security.
 - anything else that differs → the store's copy is kept and the path is reported
 
 **Sidecar directories are never renamed.** An earlier draft copied a sibling `<old>/`
@@ -327,6 +343,11 @@ repository already documents for `settings.json`.
 - junction whose target resolves under `$Legacy` → `cmd /c rmdir` the link, then relink
   to `$Store`
 - junction already targeting `$Store` → skip
+- **junction targeting anything else → refuse and report.** Not-legacy does not mean
+  already-migrated: a junction can point at a backup, a stale path, or anywhere the user
+  aimed it. Treating those as done would let the Phase 4 gate bless deleting the legacy
+  store while an account still reads and writes somewhere else — and setup will not catch
+  it either, because `New-Junction` checks only the reparse-point attribute.
 - **real directory → refuse and report; never delete**, matching `New-Junction`'s rule
 
 Removal is `cmd /c rmdir` only. `Remove-Item -Recurse` follows junctions on PowerShell
@@ -341,11 +362,19 @@ classified and copied it but *before* Phase 2 retargets that account. Those line
 only under `.claude-shared`, are never merged, and migration would otherwise report
 success and go on to bless deleting the standby copy that holds them.
 
-So Phase 1 records the size and last-write time of every file it read under `$Legacy`
-(plus a hash for each `.jsonl` it classified in Phase 1b), and Phase 2b re-checks them
-after retargeting. Any change means something wrote during the run: migration reports the
-drifted paths, states that the merge is incomplete, and **withholds the deletion guidance
-entirely**. Re-running merges the appended lines, because the merge is idempotent.
+So Phase 1 records the size and last-write time of every file it read under `$Legacy`,
+and Phase 2b **re-enumerates the whole legacy tree** afterwards — it does not merely
+re-check the recorded paths. That distinction is the point: a live session does not only
+append to transcripts that already existed, it starts new ones, and a file created after
+Phase 1 walked the tree is absent from the recorded set. A check that iterated only those
+keys could not see it, would report no drift, and would bless deleting a legacy store
+holding a transcript that was never merged.
+
+Three things count as drift: a file whose size or timestamp changed, a file that is
+present now and was not recorded, and a recorded file that has since disappeared.
+Any of them means the merge is incomplete: migration reports the drifted paths and
+**withholds the deletion guidance entirely**. Re-running merges what appeared, because
+the merge is idempotent.
 
 This closes the loss, not the race — a write can still land between the recheck and the
 report. It is enough, because nothing is destroyed while `.claude-shared` survives, and
@@ -439,7 +468,23 @@ New tests, one per defect plus the migration:
     drifted path is reported and the deletion guidance is withheld
   - a **`projects`-only account interrupted immediately after `rmdir`** is rediscovered
     through the manifest on the next run and fully repaired
+  - a **divergent `~/.claude-shared/CLAUDE.md`**, with the accounts and store in
+    agreement, still aborts preflight with nothing mutated
+  - a legacy file **created after Phase 1 enumerated the tree** is reported as drift and
+    the deletion guidance is withheld
+  - a **junction pointing at a third directory** is refused and reported, not silently
+    accepted as already migrated
+  - a forked transcript is **rescued exactly once across two runs**, under the same id
   - re-running after each of the above reaches a clean, fully migrated state
+
+**Test isolation is itself a test.** `$PROFILE` is an automatic variable fixed at session
+start from the Documents path; it does **not** follow `$HOME`. Verified: swapping `$HOME`
+leaves `$PROFILE` pointing at the real profile. Since migration's Phase 3 runs
+`install.ps1`, which writes to `$PROFILE`, the migration fixture must swap `$PROFILE`
+alongside `$HOME` — otherwise running the suite rewrites the developer's real profile to
+dot-source a script inside a temp directory that teardown then deletes, breaking every new
+shell. `$PROFILE` is writable via `Set-Variable -Scope Global`, so this needs no change to
+`install.ps1`. A guard test asserts the swap holds and is restored.
 
 ### 4. Docs
 

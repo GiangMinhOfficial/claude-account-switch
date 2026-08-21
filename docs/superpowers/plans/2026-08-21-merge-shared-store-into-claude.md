@@ -606,13 +606,48 @@ function New-LegacyFakeHome {
     # A fake home in the PRE-merge shape: a real ~/.claude-shared holding the
     # shared dirs, accounts junctioned into it, and a ~/.claude that has its own
     # divergent copies. This is what migrate-shared-store.ps1 consumes.
+    #
+    # $PROFILE IS SWAPPED TOO, and that is not optional. Migration's Phase 3
+    # runs install.ps1, which writes to $PROFILE - and $PROFILE is an automatic
+    # variable fixed at session start from the Documents path. It does NOT
+    # follow $HOME. Verified: swapping $HOME leaves $PROFILE at
+    # C:\Users\<you>\Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1.
+    # Without this line, running the suite rewrites the developer's REAL profile
+    # to dot-source a script inside a temp directory that AfterEach then deletes,
+    # breaking every new shell they open.
     $fake = Join-Path ([IO.Path]::GetTempPath()) ("claude-migrate-test-" + [guid]::NewGuid().ToString('N'))
     foreach ($d in @('projects', 'skills', 'agents', 'commands', 'hooks', 'plugins')) {
         $null = New-Item -ItemType Directory -Path (Join-Path $fake ".claude-shared\$d") -Force
         $null = New-Item -ItemType Directory -Path (Join-Path $fake ".claude\$d") -Force
     }
-    Set-Variable -Name HOME -Value $fake -Scope Global -Force
+
+    $global:ClaudeTestRealHome    = $HOME
+    $global:ClaudeTestRealProfile = $PROFILE
+
+    # LAST, so a throw above never leaves either variable pointing at a
+    # half-built temp dir.
+    Set-Variable -Name HOME    -Value $fake -Scope Global -Force
+    Set-Variable -Name PROFILE -Value (Join-Path $fake 'FakeProfile.ps1') -Scope Global -Force
     return $fake
+}
+
+function Remove-LegacyFakeHome {
+    # Restores BOTH swapped variables before deleting anything, so a throw in
+    # the cleanup cannot strand the session pointing at a deleted temp dir.
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    if ($global:ClaudeTestRealHome)    { Set-Variable -Name HOME    -Value $global:ClaudeTestRealHome    -Scope Global -Force }
+    if ($global:ClaudeTestRealProfile) { Set-Variable -Name PROFILE -Value $global:ClaudeTestRealProfile -Scope Global -Force }
+
+    Get-ChildItem -LiteralPath $Path -Directory -Force -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            # rmdir removes the link, never the target. Remove-Item -Recurse on
+            # 5.1 follows junctions and would empty the legacy store.
+            Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint } |
+                ForEach-Object { cmd /c rmdir "$($_.FullName)" | Out-Null }
+        }
+    Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 function New-LegacyAccount {
@@ -630,7 +665,29 @@ function New-LegacyAccount {
 }
 ```
 
-Reuse the existing `Remove-FakeHome` for teardown — it already unlinks reparse points before deleting, which is mandatory here.
+Do **not** reuse `Remove-FakeHome` here: it restores `$HOME` only, and these tests swap `$PROFILE` as well. `Remove-LegacyFakeHome` above is the pair for `New-LegacyFakeHome`.
+
+Then add the guard test that proves the isolation actually holds — put it first in the file so a broken fixture fails loudly before anything else runs:
+
+```powershell
+Describe 'migration tests are isolated from the real machine' {
+    It 'never lets $PROFILE point outside the fake home' {
+        # install.ps1 writes to $PROFILE, and $PROFILE does NOT follow $HOME -
+        # it is fixed at session start from the Documents path. If this ever
+        # regresses, the suite rewrites the developer's real profile to
+        # dot-source a temp path that teardown then deletes.
+        $real = $PROFILE
+        $fake = New-LegacyFakeHome
+        try {
+            $PROFILE | Should -Not -Be $real
+            $PROFILE.StartsWith($fake, 'OrdinalIgnoreCase') | Should -BeTrue
+        } finally {
+            Remove-LegacyFakeHome -Path $fake
+        }
+        $PROFILE | Should -Be $real
+    }
+}
+```
 
 - [ ] **Step 2: Write the failing discovery tests**
 
@@ -641,11 +698,10 @@ Create `tests/Migrate-SharedStore.Tests.ps1`:
 
 Describe 'migrate-shared-store.ps1 discovery' {
     BeforeEach {
-        $script:RealHome = $HOME
-        $script:FakeHome = New-LegacyFakeHome
+        $script:FakeHome = New-LegacyFakeHome   # swaps $HOME AND $PROFILE
         $script:Script   = Join-Path (Split-Path $PSScriptRoot -Parent) 'migrate-shared-store.ps1'
     }
-    AfterEach { Remove-FakeHome -Path $script:FakeHome -RealHome $script:RealHome }
+    AfterEach { Remove-LegacyFakeHome -Path $script:FakeHome }
 
     It 'finds accounts junctioned into the legacy store' {
         $null = New-LegacyAccount -Name work
@@ -848,11 +904,10 @@ is still found on the next run."
 ```powershell
 Describe 'migrate-shared-store.ps1 preflight' {
     BeforeEach {
-        $script:RealHome = $HOME
-        $script:FakeHome = New-LegacyFakeHome
+        $script:FakeHome = New-LegacyFakeHome   # swaps $HOME AND $PROFILE
         $script:Script   = Join-Path (Split-Path $PSScriptRoot -Parent) 'migrate-shared-store.ps1'
     }
-    AfterEach { Remove-FakeHome -Path $script:FakeHome -RealHome $script:RealHome }
+    AfterEach { Remove-LegacyFakeHome -Path $script:FakeHome }
 
     It 'aborts on a divergent account CLAUDE.md without mutating anything' {
         # Editor replace-on-save turns a hardlink into a plain file. If that
@@ -883,6 +938,24 @@ Describe 'migrate-shared-store.ps1 preflight' {
         Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude\CLAUDE.md') -Value 'store memory'
 
         { & $script:Script -DryRun 6>&1 | Out-Null } | Should -Not -Throw
+    }
+
+    It 'aborts when only the LEGACY CLAUDE.md has diverged' {
+        # The easiest copy to lose: Phase 1 skips CLAUDE.md entirely, so unique
+        # content here is never merged, and a clean run would then declare the
+        # legacy store safe to delete. ~/.claude-shared/CLAUDE.md is the live
+        # shared-memory path today, so it is the likeliest one an editor
+        # replaced on save.
+        $acct = New-LegacyAccount -Name work
+        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude\CLAUDE.md') -Value 'store memory'
+        $null = cmd /c mklink /H "$acct\CLAUDE.md" "$(Join-Path $script:FakeHome '.claude\CLAUDE.md')"
+        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude-shared\CLAUDE.md') `
+                    -Value 'DIVERGENT legacy memory nobody else has'
+
+        { & $script:Script 6>&1 | Out-Null } | Should -Throw -ExpectedMessage '*CLAUDE.md*'
+
+        (Get-Item -LiteralPath (Join-Path $acct 'projects') -Force).Target |
+            Should -Match 'claude-shared'
     }
 }
 ```
@@ -927,14 +1000,33 @@ Write-Head "Preflight"
 $storeMemory = Join-Path $Store 'CLAUDE.md'
 $divergent   = @()
 
+function Test-DivergentMemory {
+    # Nonblank, not the same inode as the store's copy, and not byte-identical
+    # to it. Anything matching is content that merging would silently drop.
+    param([string] $Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    if (Test-SameInode -Path $Path -Other $storeMemory)     { return $false }
+    if ([string]::IsNullOrWhiteSpace((Get-Content -LiteralPath $Path -Raw))) { return $false }
+    if ((Test-Path -LiteralPath $storeMemory -PathType Leaf) -and
+        ((Get-Content -LiteralPath $Path -Raw) -eq
+         (Get-Content -LiteralPath $storeMemory -Raw))) { return $false }
+    return $true
+}
+
+# The LEGACY copy is checked too, and it is the easier one to lose. Phase 1
+# skips CLAUDE.md entirely on the grounds that every name is one inode - so if
+# ~/.claude-shared/CLAUDE.md has drifted into an independent file, its content
+# is never merged, and a clean run would go on to say the legacy store is safe
+# to delete. That is the live shared-memory path today, so it is exactly the
+# one an editor is most likely to have replaced on save.
+if (Test-DivergentMemory -Path (Join-Path $Legacy 'CLAUDE.md')) {
+    $divergent += (Join-Path $Legacy 'CLAUDE.md')
+}
+
 foreach ($acct in $accounts) {
     $acctMemory = Join-Path $acct.FullName 'CLAUDE.md'
-    if (-not (Test-Path -LiteralPath $acctMemory -PathType Leaf)) { continue }
-    if (Test-SameInode -Path $acctMemory -Other $storeMemory)     { continue }
-    if ([string]::IsNullOrWhiteSpace((Get-Content -LiteralPath $acctMemory -Raw))) { continue }
-    if ((Test-Path -LiteralPath $storeMemory -PathType Leaf) -and
-        ((Get-Content -LiteralPath $acctMemory -Raw) -eq (Get-Content -LiteralPath $storeMemory -Raw))) { continue }
-    $divergent += $acctMemory
+    if (Test-DivergentMemory -Path $acctMemory) { $divergent += $acctMemory }
 }
 
 if ($divergent.Count -gt 0) {
@@ -983,12 +1075,11 @@ retargeted, leaving a half-migrated machine no re-run could fix."
 ```powershell
 Describe 'migrate-shared-store.ps1 merge' {
     BeforeEach {
-        $script:RealHome = $HOME
-        $script:FakeHome = New-LegacyFakeHome
+        $script:FakeHome = New-LegacyFakeHome   # swaps $HOME AND $PROFILE
         $script:Script   = Join-Path (Split-Path $PSScriptRoot -Parent) 'migrate-shared-store.ps1'
         $null = New-LegacyAccount -Name work
     }
-    AfterEach { Remove-FakeHome -Path $script:FakeHome -RealHome $script:RealHome }
+    AfterEach { Remove-LegacyFakeHome -Path $script:FakeHome }
 
     It 'copies a file that exists only in the legacy store' {
         Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude-shared\skills\only-legacy.md') -Value 'legacy'
@@ -1178,15 +1269,14 @@ must win or the copied plugin trees land unregistered."
 ```powershell
 Describe 'migrate-shared-store.ps1 transcripts' {
     BeforeEach {
-        $script:RealHome = $HOME
-        $script:FakeHome = New-LegacyFakeHome
+        $script:FakeHome = New-LegacyFakeHome   # swaps $HOME AND $PROFILE
         $script:Script   = Join-Path (Split-Path $PSScriptRoot -Parent) 'migrate-shared-store.ps1'
         $null = New-LegacyAccount -Name work
         $script:Proj = 'D--demo'
         $null = New-Item -ItemType Directory -Path (Join-Path $script:FakeHome ".claude-shared\projects\$($script:Proj)") -Force
         $null = New-Item -ItemType Directory -Path (Join-Path $script:FakeHome ".claude\projects\$($script:Proj)") -Force
     }
-    AfterEach { Remove-FakeHome -Path $script:FakeHome -RealHome $script:RealHome }
+    AfterEach { Remove-LegacyFakeHome -Path $script:FakeHome }
 
     function Write-Jsonl {
         param([string] $Path, [string[]] $Lines)
@@ -1254,6 +1344,30 @@ Describe 'migrate-shared-store.ps1 transcripts' {
         # And the store's own copy is untouched.
         (Get-Content -LiteralPath $s -Raw) | Should -Match '"n":2'
     }
+
+    It 'rescues a fork exactly once across repeated runs' {
+        # Re-running is the documented recovery for a drift or conflict abort,
+        # so rescue has to be idempotent. It is not naturally: the legacy and
+        # store copies stay forked after a rescue, so a second run classifies
+        # them as forked again. A random id would write a second copy every time.
+        $id = 'aaaaaaaa-0000-0000-0000-000000000005'
+        $s  = Join-Path $script:FakeHome ".claude\projects\$($script:Proj)\$id.jsonl"
+        $l  = Join-Path $script:FakeHome ".claude-shared\projects\$($script:Proj)\$id.jsonl"
+        Write-Jsonl -Path $s -Lines @("{`"sessionId`":`"$id`",`"n`":1}", "{`"sessionId`":`"$id`",`"n`":2}")
+        Write-Jsonl -Path $l -Lines @("{`"sessionId`":`"$id`",`"n`":1}", "{`"sessionId`":`"$id`",`"n`":99}")
+
+        & $script:Script 6>&1 | Out-Null
+        $after1 = @(Get-ChildItem -LiteralPath (Split-Path $s -Parent) -Filter '*.jsonl' |
+                    ForEach-Object { $_.Name } | Sort-Object)
+
+        & $script:Script 6>&1 | Out-Null
+        $after2 = @(Get-ChildItem -LiteralPath (Split-Path $s -Parent) -Filter '*.jsonl' |
+                    ForEach-Object { $_.Name } | Sort-Object)
+
+        $after1.Count | Should -Be 2
+        # Same set, same names - the rescue id is derived from content, not random.
+        ($after2 -join ',') | Should -Be ($after1 -join ',')
+    }
 }
 ```
 
@@ -1299,8 +1413,31 @@ function Get-JsonlRelation {
     return 'continued'
 }
 
+function Get-RescueId {
+    # DETERMINISTIC, not random. A random GUID would make rescue the one
+    # non-idempotent step in the script: the legacy and store copies stay forked
+    # after a rescue, so the next run classifies them as forked again and writes
+    # ANOTHER copy. Every re-run - which is the documented recovery for a drift
+    # or conflict abort - would multiply the transcript.
+    #
+    # Deriving the id from the old id plus the legacy file's content means a
+    # re-run computes the same name, finds the file already there, and skips.
+    # MD5 is 16 bytes, which is exactly a GUID; it is used here as a
+    # content-addressing function, not for security.
+    param([string] $OldId, [string] $LegacyPath)
+
+    $seed = $OldId + ':' + (Get-FileHash -LiteralPath $LegacyPath -Algorithm MD5).Hash
+    $md5  = [Security.Cryptography.MD5]::Create()
+    try {
+        $bytes = $md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($seed))
+    } finally {
+        $md5.Dispose()
+    }
+    return ([guid][byte[]]$bytes).ToString()
+}
+
 function New-RescuedTranscript {
-    # Copy a forked legacy transcript in under a fresh session id so both halves
+    # Copy a forked legacy transcript in under a stable rescue id so both halves
     # are resumable. Only the two top-level id FIELDS are rewritten: the other
     # mentions of the id in a transcript are temp scratchpad paths and tool
     # output, which are a historical record and resolve to nothing we own.
@@ -1310,12 +1447,18 @@ function New-RescuedTranscript {
     # without rewriting the transcript's references to it would break them.
     param([string] $LegacyPath, [string] $Destination, [string] $OldId)
 
-    $newId = [guid]::NewGuid().ToString()
-    $text  = [IO.File]::ReadAllText($LegacyPath)
-    $text  = $text.Replace("`"sessionId`":`"$OldId`"",  "`"sessionId`":`"$newId`"")
-    $text  = $text.Replace("`"session_id`":`"$OldId`"", "`"session_id`":`"$newId`"")
-
+    $newId  = Get-RescueId -OldId $OldId -LegacyPath $LegacyPath
     $target = Join-Path $Destination "$newId.jsonl"
+
+    if (Test-Path -LiteralPath $target -PathType Leaf) {
+        # An earlier run already rescued this exact content.
+        return $null
+    }
+
+    $text = [IO.File]::ReadAllText($LegacyPath)
+    $text = $text.Replace("`"sessionId`":`"$OldId`"",  "`"sessionId`":`"$newId`"")
+    $text = $text.Replace("`"session_id`":`"$OldId`"", "`"session_id`":`"$newId`"")
+
     [IO.File]::WriteAllText($target, $text, (New-Object Text.UTF8Encoding $false))
     return $newId
 }
@@ -1376,7 +1519,8 @@ function Copy-LegacyProjects {
                     $newId = New-RescuedTranscript -LegacyPath $_.FullName `
                                                    -Destination (Split-Path $target -Parent) `
                                                    -OldId $oldId
-                    $script:Rescued += "$oldId -> $newId"
+                    # $null means an earlier run already rescued this content.
+                    if ($newId) { $script:Rescued += "$oldId -> $newId" }
                 }
             }
         }
@@ -1421,11 +1565,10 @@ forked rescued under a fresh session id. Sidecar dirs are left alone."
 ```powershell
 Describe 'migrate-shared-store.ps1 retargeting' {
     BeforeEach {
-        $script:RealHome = $HOME
-        $script:FakeHome = New-LegacyFakeHome
+        $script:FakeHome = New-LegacyFakeHome   # swaps $HOME AND $PROFILE
         $script:Script   = Join-Path (Split-Path $PSScriptRoot -Parent) 'migrate-shared-store.ps1'
     }
-    AfterEach { Remove-FakeHome -Path $script:FakeHome -RealHome $script:RealHome }
+    AfterEach { Remove-LegacyFakeHome -Path $script:FakeHome }
 
     It 'repoints every junction at the store' {
         $acct = New-LegacyAccount -Name work
@@ -1463,6 +1606,36 @@ Describe 'migrate-shared-store.ps1 retargeting' {
 
         $out | Should -Match 'changed during this run'
         $out | Should -Not -Match 'safe to delete'
+    }
+
+    It 'reports drift for a file CREATED after the merge enumerated the tree' {
+        # The likelier shape of the race: a live session starts a new session
+        # rather than appending to one this run already saw. Add-Content creates
+        # the file, so a path that did not exist at Phase 1 simulates it.
+        $null = New-LegacyAccount -Name work
+        $new = Join-Path $script:FakeHome '.claude-shared\projects\brand-new.jsonl'
+
+        $out = & $script:Script -SimulateDriftPath $new 6>&1 | Out-String -Width 500
+
+        $out | Should -Match 'changed during this run'
+        $out | Should -Not -Match 'safe to delete'
+    }
+
+    It 'refuses a junction pointing somewhere that is neither store nor legacy' {
+        # Not automatically "already migrated". Treating it as such would let the
+        # final gate bless deleting the legacy store while this account still
+        # reads and writes to a third location.
+        $acct  = New-LegacyAccount -Name work -Dirs @('projects')
+        $other = Join-Path $script:FakeHome 'somewhere-else'
+        $null  = New-Item -ItemType Directory -Path $other -Force
+        $null  = cmd /c mklink /J "$acct\skills" "$other"
+
+        $out = & $script:Script 6>&1 | Out-String -Width 500
+
+        $out | Should -Match 'Unexpected junction target'
+        $out | Should -Not -Match 'safe to delete'
+        @((Get-Item -LiteralPath (Join-Path $acct 'skills') -Force).Target)[0] |
+            Should -Match 'somewhere-else'
     }
 }
 ```
@@ -1513,7 +1686,20 @@ foreach ($acct in $accounts) {
             continue
         }
         if (-not (Test-JunctionInto -Path $link -Root $Legacy)) {
-            Write-Skip "already points at the store: $($acct.Name)\$dir"
+            # Three outcomes, not two. A reparse point that is not the legacy
+            # store is NOT automatically the new store: it can point at a
+            # backup, a stale path, or anywhere the user aimed it. Calling that
+            # "already migrated" would let the final gate bless deleting the
+            # legacy store while this account still reads and writes elsewhere -
+            # and setup will not catch it either, because New-Junction checks
+            # only the reparse-point attribute.
+            if (Test-JunctionInto -Path $link -Root $Store) {
+                Write-Skip "already points at the store: $($acct.Name)\$dir"
+            } else {
+                $target = @((Get-Item -LiteralPath $link -Force).Target) | Select-Object -First 1
+                $refused += $link
+                Write-Warn "Unexpected junction target, leaving it alone: $link -> $target"
+            }
             continue
         }
         if ($DryRun) { Write-Step "would retarget $link"; continue }
@@ -1535,14 +1721,31 @@ if ($SimulateDriftPath) {
 
 Write-Head "Stability check"
 
+# Re-enumerate the WHOLE legacy tree, rather than only re-checking the files
+# Phase 1 happened to read. A live Claude Code session does not just append to
+# transcripts it already had - it creates new ones. A file that appeared after
+# Phase 1 enumerated the tree is absent from $script:ReadFiles, so a check that
+# only walks those keys cannot see it, would report no drift, and would go on to
+# bless deleting a legacy store holding a transcript that was never merged.
 $script:Drifted = @()
-foreach ($path in $script:ReadFiles.Keys) {
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { $script:Drifted += $path; continue }
-    $now  = Get-Item -LiteralPath $path -Force
-    $then = $script:ReadFiles[$path]
-    if ($now.Length -ne $then.Length -or $now.LastWriteTimeUtc -ne $then.LastWriteTimeUtc) {
-        $script:Drifted += $path
+$seenNow        = @{}
+
+Get-ChildItem -LiteralPath $Legacy -Recurse -File -Force -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        $seenNow[$_.FullName] = $true
+        $then = $script:ReadFiles[$_.FullName]
+        if ($null -eq $then) {
+            # Created during the run, so it was never merged.
+            $script:Drifted += $_.FullName
+        } elseif ($_.Length -ne $then.Length -or $_.LastWriteTimeUtc -ne $then.LastWriteTimeUtc) {
+            $script:Drifted += $_.FullName
+        }
     }
+
+foreach ($path in $script:ReadFiles.Keys) {
+    # Disappeared during the run. Not a merge gap, but it means the source moved
+    # under us and the run's picture of it is stale either way.
+    if (-not $seenNow.ContainsKey($path)) { $script:Drifted += $path }
 }
 
 if ($script:Drifted.Count -gt 0) {
@@ -1589,12 +1792,11 @@ never deleted. Drift during the run blocks the deletion guidance."
 ```powershell
 Describe 'migrate-shared-store.ps1 handoff and report' {
     BeforeEach {
-        $script:RealHome = $HOME
-        $script:FakeHome = New-LegacyFakeHome
+        $script:FakeHome = New-LegacyFakeHome   # swaps $HOME AND $PROFILE
         $script:Script   = Join-Path (Split-Path $PSScriptRoot -Parent) 'migrate-shared-store.ps1'
         $null = New-LegacyAccount -Name work
     }
-    AfterEach { Remove-FakeHome -Path $script:FakeHome -RealHome $script:RealHome }
+    AfterEach { Remove-LegacyFakeHome -Path $script:FakeHome }
 
     It 'forwards -DryRun to setup so the handoff writes nothing' {
         # -NoSeed does NOT make setup inert: it still copies statusline.sh,
