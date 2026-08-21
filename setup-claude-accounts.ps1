@@ -7,30 +7,26 @@
     Each account gets its own config dir (~/.claude-<name>) holding its own
     .credentials.json and .claude.json, so logins are fully separate.
 
-    Directories that should be common to every account (session transcripts,
-    skills, agents, plugins, ...) live once in ~/.claude-shared and are exposed
-    to each account through an NTFS directory junction. One copy of truth --
-    no syncing, no divergence.
+    ~/.claude is the shared store as well as the config dir used by a shell
+    with no CLAUDE_CONFIG_DIR. Directories that should be common to every
+    account (session transcripts, skills, agents, plugins, ...) live there once
+    and are exposed to each account through an NTFS directory junction. One
+    copy of truth -- no syncing, no divergence.
 
     Your global memory file, CLAUDE.md, gets the same treatment. It is a FILE,
     and a junction only links directories, so it is shared with an NTFS
-    hardlink instead. The real file stays in ~/.claude; the shared store and
-    every account hold additional names for that same inode, so editing
-    CLAUDE.md from any account edits it for all of them.
+    hardlink instead. The real file stays in the ~/.claude store and every
+    account holds an additional name for that same inode, so editing CLAUDE.md
+    from any account edits it for all of them.
 
     The status line is shared a third way, because it needs no link at all:
     Claude Code names it by PATH in settings.json. One copy of statusline.sh
-    lives in ~/.claude-shared and every account's settings.json points at it,
+    lives in ~/.claude and every account's settings.json points at it,
     so all accounts show the same bar and one edit changes them all.
 
-    This script never deletes anything from ~/.claude. Your existing setup
-    stays intact as a fallback: a shell with no CLAUDE_CONFIG_DIR set still
-    uses it. It writes there in exactly two places: an empty
-    ~/.claude/CLAUDE.md is created if you have none at all, so the shared
-    memory file has somewhere to be a second name for, and the statusLine key
-    of ~/.claude/settings.json is pointed at the shared script - that file is
-    the template every new account's settings are seeded from, so leaving it
-    behind would hand the next account the old status line.
+    Setup only ever adds to ~/.claude; it never deletes. Existing config stays
+    usable by the fallback shell while also becoming the one shared store for
+    every named account.
 
 .EXAMPLE
     .\setup-claude-accounts.ps1 -DryRun
@@ -117,7 +113,12 @@ foreach ($name in $Accounts) {
     }
 }
 
-$Shared = Join-Path $HOME '.claude-shared'
+# The store IS ~/.claude. It holds the real shared dirs, CLAUDE.md,
+# statusline.sh and bin/, and every account junctions/hardlinks into it.
+# It is also the config dir a shell with no CLAUDE_CONFIG_DIR falls back to,
+# so $Shared and $SeedFrom are normally the SAME path - several guards below
+# exist only because of that overlap and say so.
+$Shared = Join-Path $HOME '.claude'
 
 # Ephemeral/regenerable - not worth copying into the seeded account
 $SkipDirs = @('shell-snapshots', 'debug', 'paste-cache', 'downloads', 'cache', 'backups')
@@ -540,6 +541,14 @@ if (-not $NoStatusLine) {
     }
 }
 
+# The store is also $SeedFrom now. Exclude the path-addressed status line from
+# the seeded account or robocopy would manufacture a per-account copy after the
+# shared copy was placed in ~/.claude above.
+$SeedExcludeFiles = @($SharedFiles)
+if ($StatusLineCommand) {
+    $SeedExcludeFiles += [IO.Path]::GetFileName($StatusLine)
+}
+
 # ----------------------------------------------------------- accounts --------
 
 foreach ($name in $Accounts) {
@@ -561,7 +570,7 @@ foreach ($name in $Accounts) {
             # below would have to decide whether the copy or the shared file
             # was the real one.
             Copy-Tree -Source $SeedFrom -Destination $acct `
-                      -ExcludeDirs ($SharedDirs + $SkipDirs) -ExcludeFiles $SharedFiles
+                      -ExcludeDirs ($SharedDirs + $SkipDirs) -ExcludeFiles $SeedExcludeFiles
             Write-Done "config + credentials copied from $SeedFrom"
         }
         $srcJson = Join-Path $HOME '.claude.json'

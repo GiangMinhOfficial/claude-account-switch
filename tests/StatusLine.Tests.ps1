@@ -1,7 +1,7 @@
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0' }
 
 # The status line is the one shared thing with no link behind it: Claude Code
-# names it by PATH in settings.json, so a single copy in ~/.claude-shared is
+# names it by PATH in settings.json, so a single copy in ~/.claude is
 # enough and every account's settings.json is pointed at it. What has to be
 # tested instead is the EDIT: settings.json is a file Claude Code owns and the
 # user hand-edits, so the one key must change and nothing else may - not the
@@ -101,7 +101,7 @@ Describe 'setup-claude-accounts.ps1 shares the status line' {
     It 'keeps one copy of the script in the shared store and points every account at it' {
         $null = & $script:SetupScript -Accounts work,personal -SeedInto work 6>&1
 
-        $shared = Join-Path $script:FakeHome '.claude-shared\statusline.sh'
+        $shared = Join-Path $script:FakeHome '.claude\statusline.sh'
         Test-Path -LiteralPath $shared | Should -BeTrue
         (Get-FileHash -LiteralPath $shared).Hash |
             Should -Be (Get-FileHash -LiteralPath $script:StatusLineScript).Hash
@@ -196,7 +196,7 @@ Describe 'setup-claude-accounts.ps1 shares the status line' {
         $null = & $script:SetupScript -Accounts work -SeedInto work -NoStatusLine 6>&1
 
         (Get-FileHash -LiteralPath $path).Hash | Should -Be $before
-        Test-Path -LiteralPath (Join-Path $script:FakeHome '.claude-shared\statusline.sh') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $script:FakeHome '.claude\statusline.sh') | Should -BeFalse
         (Get-StatusLineCommand -SettingsPath (Join-Path $script:FakeHome '.claude-work\settings.json')) |
             Should -Be 'node old-statusline.js'
     }
@@ -208,7 +208,7 @@ Describe 'setup-claude-accounts.ps1 shares the status line' {
         $out = & $script:SetupScript -Accounts work -SeedInto work -DryRun 6>&1 | Out-String -Width 500
 
         (Get-FileHash -LiteralPath $path).Hash | Should -Be $before
-        Test-Path -LiteralPath (Join-Path $script:FakeHome '.claude-shared') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $script:FakeHome '.claude\statusline.sh') | Should -BeFalse
         $out | Should -Match 'would copy .*statusline\.sh'
         $out | Should -Match 'would replace the status line'
     }

@@ -24,7 +24,8 @@ $script:ClaudeInvalidNameClass = '[\\/:*?"<>|\[\]]'
 
 function Get-ClaudeAccountDir {
     # An account dir always has a projects/ entry. This filters out unrelated
-    # ~/.claude-* dirs such as .claude-mem (claude-mem plugin data).
+    # ~/.claude-* dirs such as .claude-mem (claude-mem plugin data), and the
+    # leftover legacy ~/.claude-shared store that migration leaves on disk.
     Get-ChildItem -Path $HOME -Directory -Filter '.claude-*' -Force |
         Where-Object {
             $_.Name -ne '.claude-shared' -and
@@ -59,7 +60,7 @@ function Test-ClaudeSharedMemory {
     param([Parameter(Mandatory = $true)][string] $AccountDir)
 
     $link   = Join-Path $AccountDir 'CLAUDE.md'
-    $shared = Join-Path $HOME '.claude-shared\CLAUDE.md'
+    $shared = Join-Path $HOME '.claude\CLAUDE.md'
     if (-not (Test-Path -LiteralPath $link -PathType Leaf)) { return $false }
     if (-not (Test-Path -LiteralPath $shared -PathType Leaf)) { return $false }
 
@@ -90,7 +91,7 @@ function Get-ClaudeAccount {
     # Only worth reporting on when shared memory is set up at all. Without this
     # gate, anyone who left CLAUDE.md out of -SharedFiles gets every account
     # flagged for a thing they chose.
-    $memoryIsShared = Test-Path -LiteralPath (Join-Path $HOME '.claude-shared\CLAUDE.md') -PathType Leaf
+    $memoryIsShared = Test-Path -LiteralPath (Join-Path $HOME '.claude\CLAUDE.md') -PathType Leaf
 
     Write-Host "available:"
     Get-ClaudeAccountDir | ForEach-Object {
@@ -219,8 +220,9 @@ function Rename-ClaudeAccount {
         return
     }
 
-    # Get-ClaudeAccountDir, not Test-Path: a bare Test-Path admits
-    # ~/.claude-shared (which every junction targets) and ~/.claude-mem.
+    # Get-ClaudeAccountDir, not Test-Path: a bare Test-Path admits the leftover
+    # legacy ~/.claude-shared store (which old junctions may still target) and
+    # ~/.claude-mem.
     $account = Get-ClaudeAccountDir | Where-Object { $_.Name -eq ".claude-$Name" }
     if (-not $account) {
         # Test-Path here picks the MESSAGE, never decides existence. One

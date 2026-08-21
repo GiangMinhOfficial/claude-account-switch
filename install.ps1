@@ -4,7 +4,7 @@
     Wire the Claude account-switching functions into your PowerShell profile.
 
 .DESCRIPTION
-    By default, copies claude-account-profile.ps1 into ~/.claude-shared/bin and adds
+    By default, copies claude-account-profile.ps1 into ~/.claude/bin and adds
     a marked block to $PROFILE that dot-sources it from there. The repo can then be
     moved or deleted without breaking your shell. Re-run this after a `git pull` to
     pick up changes.
@@ -33,7 +33,7 @@ $BeginMarker = '# >>> claude-account-switch >>>'
 $EndMarker   = '# <<< claude-account-switch <<<'
 $ProfilePath = $PROFILE
 $RepoScript  = Join-Path $PSScriptRoot 'claude-account-profile.ps1'
-$BinDir      = Join-Path $HOME '.claude-shared\bin'
+$BinDir      = Join-Path $HOME '.claude\bin'
 $InstalledTo = Join-Path $BinDir 'claude-account-profile.ps1'
 
 if (-not $Uninstall -and -not (Test-Path -LiteralPath $RepoScript)) {

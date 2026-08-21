@@ -8,7 +8,9 @@ function Initialize-FakeHome {
     # Register-ClaudeAccountFunctions at load and would otherwise register
     # every real account on this machine.
     $fake = Join-Path ([IO.Path]::GetTempPath()) ("claude-rename-test-" + [guid]::NewGuid().ToString('N'))
-    $projects = Join-Path $fake '.claude-shared\projects'
+    # The store IS ~/.claude now - it is both the shared store and the config
+    # dir a shell with no CLAUDE_CONFIG_DIR falls back to.
+    $projects = Join-Path $fake '.claude\projects'
     $null = New-Item -ItemType Directory -Path $projects -Force
     Set-Content -LiteralPath (Join-Path $projects 'sentinel.txt') -Value 'shared-store-sentinel'
 
@@ -24,7 +26,7 @@ function New-FixtureAccount {
     param([Parameter(Mandatory = $true)][string] $Name)
     $dir = Join-Path $HOME ".claude-$Name"
     $null = New-Item -ItemType Directory -Path $dir -Force
-    $null = cmd /c mklink /J "$dir\projects" "$(Join-Path $HOME '.claude-shared\projects')"
+    $null = cmd /c mklink /J "$dir\projects" "$(Join-Path $HOME '.claude\projects')"
     return $dir
 }
 
