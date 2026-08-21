@@ -236,6 +236,39 @@ which has neither a `projects/` entry nor a junction into the legacy store.
 
 This is what finds `james` and `minhgh` rather than the `work,personal` defaults.
 
+**The widened rule is still not sufficient on its own.** An account configured with
+`-SharedDirs projects` alone has exactly one signal, and losing it mid-`rmdir` makes the
+account undiscoverable by *any* on-disk rule. So before Phase 2 mutates anything,
+migration writes a transient manifest to `~/.claude/.migrate-shared-store.state` listing
+the discovered accounts, and Phase 0 unions any existing manifest into its discovery.
+The manifest is deleted once Phase 3 completes.
+
+This is not the account registry the architecture rejects. That principle — **the
+directory is the account** — is about the steady state: no persistent alias table, no
+rename log, nothing that can disagree with the filesystem. The manifest exists only
+inside a single migration run, is authoritative for nothing, and is removed on success.
+Its presence afterwards is itself the signal that a run did not finish.
+
+**Phase 0b — preflight `CLAUDE.md`, before any mutation.** Phase 1 skips `CLAUDE.md` on
+the grounds that every name is already one inode. That is true on the machine measured
+here, but it is an *assumption*, and the repository already knows it can be false:
+editor replace-on-save breaks a hardlink into a plain file, which is precisely what
+`Get-ClaudeAccount`'s "CLAUDE.md not shared" tag reports and what
+`tests/SharedMemoryFile.Tests.ps1:238` simulates.
+
+If an account holds a divergent, nonempty `CLAUDE.md`, the failure is not benign.
+Phase 2 retargets that account's junctions, then Phase 3's setup reaches
+`New-FileLink -Link <account>/CLAUDE.md -Target <store>/CLAUDE.md` and **throws**
+"Refusing to overwrite" — and it throws *after* the per-account junction loop
+(`setup-claude-accounts.ps1:583` runs before `:587`), so the machine is left partially
+migrated and every re-run reproduces the same abort with no reconciliation path.
+
+So preflight classifies every account's `CLAUDE.md` as absent, blank, byte-identical,
+a true hardlink peer, or **divergent**. Any divergence aborts the run before a single
+byte is written, naming each offending file and telling the user to merge and delete it.
+Refusing before mutation is the same rule `New-FileLink` already follows; the only
+change is doing it early enough to matter.
+
 **Phase 1 — merge, with a policy per source:**
 
 | Source | Rule |
@@ -244,18 +277,29 @@ This is what finds `james` and `minhgh` rather than the `work,personal` defaults
 | `skills/`, `agents/`, `commands/`, `hooks/` | add if missing |
 | `plugins/` | legacy wins on conflict: overwrite differing files, add missing ones, delete nothing (Decision 5) |
 | `bin/`, `statusline.sh` | copy in as store-only artifacts |
-| `CLAUDE.md` | nothing to do — already one inode under all four names |
+| `CLAUDE.md` | nothing to do — preflight has already proved every name is one inode |
 
 **Phase 1b — conflict classification inside `projects/`.** A `.jsonl` present on both
 sides is classified before anything is written:
 
 - legacy copy is a strict line-prefix of the store's → *superseded*, skipped. The store
   already holds every line the legacy file has.
-- store copy is a strict line-prefix of the legacy's → *continued*, and the **legacy file
-  is adopted**, overwriting the store's. This is the one overwrite `projects/` permits,
-  and it is safe by construction: the file being replaced is a strict subset of the file
-  replacing it, so no line is lost. Without this case a continued session would fall
-  through to "reported only" and its extra lines would never enter the merged store.
+- store copy is a strict line-prefix of the legacy's, **and every additional legacy line
+  parses as JSON** → *continued*, and the **legacy file is adopted**, overwriting the
+  store's. This is the one overwrite `projects/` permits. Without this case a continued
+  session would fall through to "reported only" and its extra lines would never enter the
+  merged store.
+
+  The parse check is not ceremony. "Strict line-prefix" proves only that the earlier
+  lines were retained; it says nothing about the added ones. A transcript from a crashed
+  or still-running session ends in a truncated line, which satisfies the prefix test
+  exactly and would otherwise let a partial write overwrite the canonical, valid copy.
+  A file whose added lines do not all parse is classified as an unresolved conflict
+  instead — reported, never adopted.
+
+  Adoption writes to a temporary file in the destination directory and then moves it into
+  place, so an interrupted adoption cannot leave a half-written transcript where a valid
+  one used to be.
 - neither is a prefix of the other → **genuinely forked**, and **rescued**: copied to
   `<newGuid>.jsonl` with only `"sessionId":"<old>"` and `"session_id":"<old>"` replaced.
 - anything else that differs → the store's copy is kept and the path is reported
@@ -290,6 +334,23 @@ Removal is `cmd /c rmdir` only. `Remove-Item -Recurse` follows junctions on Powe
 trims trailing separators, because `Resolve-Path` and `FileInfo.Target` do not normalise
 them.
 
+**Phase 2b — stability recheck.** "Close all Claude Code sessions first" is a documented
+precondition with nothing enforcing it, and the phase ordering leaves a real window: a
+live session still pointed at the legacy store can append to a transcript *after* Phase 1
+classified and copied it but *before* Phase 2 retargets that account. Those lines exist
+only under `.claude-shared`, are never merged, and migration would otherwise report
+success and go on to bless deleting the standby copy that holds them.
+
+So Phase 1 records the size and last-write time of every file it read under `$Legacy`
+(plus a hash for each `.jsonl` it classified in Phase 1b), and Phase 2b re-checks them
+after retargeting. Any change means something wrote during the run: migration reports the
+drifted paths, states that the merge is incomplete, and **withholds the deletion guidance
+entirely**. Re-running merges the appended lines, because the merge is idempotent.
+
+This closes the loss, not the race — a write can still land between the recheck and the
+report. It is enough, because nothing is destroyed while `.claude-shared` survives, and
+the recheck governs exactly the advice that would destroy it.
+
 **Phase 3 — hand off to setup, then re-install the profile.** The final steps run
 `setup-claude-accounts.ps1 -Accounts <discovered> -NoSeed` and then `install.ps1`. Setup
 rewrites every `statusLine` from the `.claude-shared` path to the `.claude` one,
@@ -306,18 +367,24 @@ holds an absolute path into `.claude-shared\bin`; copying `bin/` into the store 
 update it. Without this step a user who follows the Phase 4 guidance and deletes the
 legacy store loses every account-switching function in new shells.
 
-Order is merge → retarget → setup → install. Nothing is removed before its replacement
-exists.
+Order is preflight → merge → retarget → recheck → setup → install. Nothing is removed
+before its replacement exists, and nothing is mutated before preflight has passed.
 
 **Phase 4 — report.** Copied, skipped, superseded, adopted, rescued (old id → new id),
 unresolved conflicts, and junctions retargeted.
 
-The closing guidance is **conditional, not an invitation**: `.claude-shared` is kept as a
-full standby copy, and it is safe to delete only once `install.ps1` has re-run
-successfully and a *new* shell has been opened and confirmed working. Deleting it while
-`$PROFILE` still points into `.claude-shared\bin` breaks every account-switching function
-in future shells. If Phase 3 did not complete, the report says so and withholds the
-deletion guidance entirely.
+The closing guidance is **conditional, not an invitation**. `.claude-shared` is kept as a
+full standby copy, and the report offers deletion guidance only when *all* of these hold:
+
+- preflight passed and no `CLAUDE.md` was divergent
+- Phase 2b found no drift under `$Legacy`
+- no unresolved conflicts were reported
+- Phase 3 completed, `install.ps1` included
+
+Otherwise the report says which condition failed and withholds the guidance entirely.
+Even when it is offered, it is qualified: delete only after opening a *new* shell and
+confirming the account-switching functions still work, because a `$PROFILE` still
+pointing into `.claude-shared\bin` breaks every one of them in future shells.
 
 **Out of scope for migration:** deleting `.claude-shared`; touching `.credentials.json`
 or `.claude.json`; reconciling anything inside `plugins/` beyond Decision 5.
@@ -354,12 +421,22 @@ New tests, one per defect plus the migration:
 - the `$memoryIsShared` gate: setup with `-SharedFiles other.md` flags nothing
 - reporting honesty: the summary never claims "not modified" after `statusline.sh` was
   copied
-- migration: `-DryRun` writes nothing, **including through the setup and install
-  handoffs** · a prefix-superseded `.jsonl` is skipped · a reverse-prefix `.jsonl` is
-  adopted and the store's shorter copy replaced · a forked `.jsonl` is rescued under a new
-  id with its sidecar directory left untouched · a junction is retargeted from a legacy
-  fixture · an account whose `projects/` junction is missing entirely is still discovered
-  and repaired · a real directory in the way is refused · `plugins/` legacy-wins
+- migration, ordinary paths: `-DryRun` writes nothing, **including through the setup and
+  install handoffs** · a prefix-superseded `.jsonl` is skipped · a reverse-prefix `.jsonl`
+  is adopted and the store's shorter copy replaced · a forked `.jsonl` is rescued under a
+  new id with its sidecar directory left untouched · a junction is retargeted from a
+  legacy fixture · a real directory in the way is refused · `plugins/` legacy-wins
+
+- migration, adversarial paths — one per finding from the review pass:
+  - an account holding a **divergent nonempty `CLAUDE.md`** aborts the run in preflight,
+    and the assertion is that *nothing was mutated*: junctions still target `$Legacy`
+  - a legacy transcript whose extra lines end in a **truncated line** is reported as an
+    unresolved conflict, never adopted, and the store's valid copy is byte-unchanged
+  - a **write into `$Legacy` between merge and retarget** is caught by Phase 2b: the
+    drifted path is reported and the deletion guidance is withheld
+  - a **`projects`-only account interrupted immediately after `rmdir`** is rediscovered
+    through the manifest on the next run and fully repaired
+  - re-running after each of the above reaches a clean, fully migrated state
 
 ### 4. Docs
 
@@ -403,9 +480,18 @@ New tests, one per defect plus the migration:
   mean adding a marker file, and that trade should be made explicitly if the quiet
   failure is ever observed in practice.
 - The uninstall-documentation claim behind Decision 4 is unverified.
-- Migration is not transactional. It is re-runnable, and the only content it overwrites
-  is a strict subset of what replaces it, so a failed run is resumed by running it again.
-  An interruption between Phase 1 and Phase 2 leaves accounts pointing at the legacy store
-  with the merge already done — harmless. An interruption *inside* Phase 2, between
-  removing a junction and recreating it, is the one state that would otherwise be
-  unrecoverable, and is what the widened discovery rule in Phase 0 exists to catch.
+- Migration is not transactional. It is re-runnable, the only content it overwrites is a
+  validated strict subset of what replaces it, and it mutates nothing until preflight has
+  passed — so a failed run is resumed by running it again. An interruption between Phase 1
+  and Phase 2 leaves accounts pointing at the legacy store with the merge already done,
+  which is harmless. An interruption *inside* Phase 2, between removing a junction and
+  recreating it, is the state that would otherwise be unrecoverable; the widened discovery
+  rule catches the common case and the transient manifest catches the rest.
+
+- Quiescence is checked, not enforced. Phase 2b detects that something wrote to the legacy
+  store during the run and withholds the deletion guidance, but it cannot prevent the
+  write, and a write landing after the recheck is not detected. This is acceptable only
+  because `.claude-shared` is never deleted by the tool: the guidance is the only path to
+  data loss, and that is what the check governs. Enforcing quiescence would mean
+  identifying and refusing to run alongside live Claude Code processes, which is
+  deliberately out of scope.
