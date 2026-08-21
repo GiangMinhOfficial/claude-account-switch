@@ -206,6 +206,27 @@ function Test-BlankFile {
     return [string]::IsNullOrWhiteSpace((Get-Content -LiteralPath $Path -Raw))
 }
 
+function Find-SharedFilePeer {
+    # A surviving name for a shared file's inode, found among the account dirs.
+    #
+    # When the store was a separate directory it was itself the recovery handle:
+    # ~/.claude could lose its copy and be re-linked from ~/.claude-shared. Now
+    # that those are one path, the accounts are the only other names, so they
+    # are where a deleted store file has to be recovered from.
+    param([string] $FileName, [string] $Store)
+
+    $storeFull = (Get-Item -LiteralPath $Store -Force).FullName.TrimEnd('\')
+    Get-ChildItem -Path $HOME -Directory -Filter '.claude-*' -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName.TrimEnd('\') -ne $storeFull } |
+        ForEach-Object {
+            $candidate = Join-Path $_.FullName $FileName
+            if ((Test-Path -LiteralPath $candidate -PathType Leaf) -and
+                -not (Test-BlankFile -Path $candidate)) {
+                return $candidate
+            }
+        } | Select-Object -First 1
+}
+
 function Test-SameContent {
     param([string] $Path, [string] $Other)
     if ((Get-Item -LiteralPath $Path -Force).Length -ne (Get-Item -LiteralPath $Other -Force).Length) { return $false }
@@ -468,6 +489,18 @@ foreach ($file in $SharedFiles) {
         } else {
             Write-Skip "$file (no $SeedFrom to link it back into)"
         }
+    } elseif ($peer = Find-SharedFilePeer -FileName $file -Store $Shared) {
+        # The store's name is gone but the inode is alive under an account's
+        # name. Re-link rather than creating an empty file: an empty store file
+        # would make the per-account pass below hit New-FileLink's refusal on
+        # every account that still has content, aborting the run.
+        if ($DryRun) {
+            Write-Step "would re-link $file into $Shared from $peer"
+        } else {
+            New-FileLink -Link $target -Target $peer
+            Write-Done "$file (recovered from $peer)"
+        }
+        $SeedFromAdditions += $file
     } elseif (Test-Path -LiteralPath $SeedFrom) {
         # The one thing this script adds to ~/.claude, and only when you have
         # no $file at all: the shared copy needs a real file to be a name for.

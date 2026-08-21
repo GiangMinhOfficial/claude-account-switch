@@ -170,19 +170,25 @@ Describe 'setup-claude-accounts.ps1 shares CLAUDE.md' {
             Should -Match 'seeded line'
     }
 
-    # SKIPPED until Task 4: with the store at ~/.claude the old recovery branch
-    # is unreachable, and the replacement recovers from an account peer instead.
-    It 'gives ~/.claude its name back when only the store still has the file' -Skip {
-        & $script:SetupScript -Accounts work -SeedInto work 6>&1 | Out-Null
-        Remove-Item -LiteralPath (Join-Path $script:FakeHome '.claude\CLAUDE.md') -Force
+    It 'recovers a deleted store CLAUDE.md from a surviving account copy' {
+        # With the store at ~/.claude, the old recovery branch is unreachable:
+        # it fired when the store still had the file and ~/.claude did not, and
+        # those are now one path. The inode survives under the ACCOUNT names,
+        # so that is where the recovery handle has to come from.
+        & $script:SetupScript -Accounts work -SeedInto work -NoStatusLine 6>&1 | Out-Null
+        $store = Join-Path $script:FakeHome '.claude\CLAUDE.md'
+        Set-Content -LiteralPath $store -Value 'memory worth keeping'
+        Remove-Item -LiteralPath $store -Force
 
-        & $script:SetupScript -Accounts work -NoSeed 6>&1 | Out-Null
+        # Must NOT throw. Creating an empty store file here would make the
+        # per-account link pass refuse to overwrite the account's copy and
+        # abort the whole run.
+        { & $script:SetupScript -Accounts work -NoSeed -NoStatusLine 6>&1 | Out-Null } |
+            Should -Not -Throw
 
-        # Deleting one name for an inode leaves the content alive under the rest.
-        Test-OneInode (Join-Path $script:FakeHome '.claude-work\CLAUDE.md') `
-                      (Join-Path $script:FakeHome '.claude\CLAUDE.md') | Should -BeTrue
-        (Get-Content -LiteralPath (Join-Path $script:FakeHome '.claude\CLAUDE.md') -Raw) |
-            Should -Match 'seeded line'
+        Test-OneInode $store (Join-Path $script:FakeHome '.claude-work\CLAUDE.md') |
+            Should -BeTrue
+        (Get-Content -LiteralPath $store -Raw) | Should -Match 'memory worth keeping'
     }
 
     It 'shares more than one file when asked' {
