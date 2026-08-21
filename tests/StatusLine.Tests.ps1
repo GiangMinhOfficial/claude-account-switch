@@ -159,6 +159,25 @@ Describe 'setup-claude-accounts.ps1 shares the status line' {
         (Get-FileHash -LiteralPath $path).Hash | Should -Be $before
     }
 
+    It 'reports the statusline.sh it rewrote in the store rather than claiming nothing changed' {
+        # The store IS ~/.claude, so overwriting statusline.sh there modifies it.
+        # The copy is recorded in neither list, so a re-run whose ONLY change is
+        # that copy printed "Your original ~/.claude was not modified".
+        & $script:SetupScript -Accounts work -SeedInto work 6>&1 | Out-Null
+        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude\statusline.sh') `
+                    -Value '# stale - differs from the repo copy' -Encoding utf8
+
+        # Second run: dirs already seeded, CLAUDE.md already linked, settings.json
+        # already correct. Only the status-line copy fires.
+        $out = & $script:SetupScript -Accounts work -NoSeed 6>&1 | Out-String -Width 500
+
+        # Assert on the change being REPORTED, not on the absence of a phrase -
+        # this task deletes that phrase, so a negative-only assertion would pass
+        # for the wrong reason.
+        $out | Should -Match 'This run changed:.*statusline\.sh'
+        $out | Should -Not -Match 'not modified'
+    }
+
     It 'replaces a status line the account already had, and says what it was' {
         $out = & $script:SetupScript -Accounts work -SeedInto work 6>&1 | Out-String -Width 500
 
@@ -185,7 +204,7 @@ Describe 'setup-claude-accounts.ps1 shares the status line' {
 
         $out = & $script:SetupScript -Accounts work -NoSeed 6>&1 | Out-String -Width 500
 
-        $out | Should -Not -Match 'Your original ~/\.claude was not modified'
+        $out | Should -Not -Match 'Nothing in .* was added or changed\.'
         $out | Should -Match 'settings\.json \(created, to hold the status line\)'
     }
 

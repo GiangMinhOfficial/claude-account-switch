@@ -436,6 +436,13 @@ if ($SeedInto -and ($Accounts -notcontains $SeedInto)) {
 
 Write-Head "Shared store"
 
+# Anything this run puts INTO the store, or changes there. The store is now
+# ~/.claude itself, so this covers the shared dirs and statusline.sh as well as
+# the shared files - a summary that only counted the last of those could claim
+# nothing was modified after modifying it.
+$SeedFromAdditions = @()
+$SeedFromEdits     = @()
+
 if (-not (Test-Path -LiteralPath $Shared)) {
     if (-not $DryRun) { $null = New-Item -ItemType Directory -Path $Shared -Force }
     Write-Done "created $Shared"
@@ -454,17 +461,13 @@ foreach ($dir in $SharedDirs) {
     if (Test-Path -LiteralPath $origin) {
         Copy-Tree -Source $origin -Destination $target
         Write-Done "$dir (copied from current config)"
+        $SeedFromAdditions += "$dir/"
     } else {
         if (-not $DryRun) { $null = New-Item -ItemType Directory -Path $target -Force }
         Write-Done "$dir (created empty)"
+        $SeedFromAdditions += "$dir/"
     }
 }
-
-# Anything this run puts INTO $SeedFrom, or changes there, so the closing
-# summary can say so rather than repeating a "nothing was modified" line that
-# stopped being true.
-$SeedFromAdditions = @()
-$SeedFromEdits     = @()
 
 foreach ($file in $SharedFiles) {
     $target = Join-Path $Shared   $file
@@ -557,6 +560,7 @@ if (-not $NoStatusLine) {
         } else {
             Copy-Item -LiteralPath $StatusLine -Destination $target -Force
             Write-Done "copied $([IO.Path]::GetFileName($StatusLine)) -> $Shared"
+            $SeedFromEdits += [IO.Path]::GetFileName($StatusLine)
         }
 
         # Forward slashes, and each half quoted: this string is embedded in
@@ -650,7 +654,7 @@ if ($SeedFromAdditions.Count -gt 0 -or $SeedFromEdits.Count -gt 0) {
         Write-Host "  This run $($changed): $($SeedFromEdits -join ', ')"
     }
 } else {
-    Write-Host "  Your original ~/.claude was not modified."
+    Write-Host "  Nothing in $SeedFrom was added or changed."
 }
 Write-Host ""
 Write-Host "  Next - open a NEW shell, then:"
