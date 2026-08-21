@@ -123,6 +123,13 @@ $Shared = Join-Path $HOME '.claude'
 # Ephemeral/regenerable - not worth copying into the seeded account
 $SkipDirs = @('shell-snapshots', 'debug', 'paste-cache', 'downloads', 'cache', 'backups')
 
+# Store-only: these live in the store but are NOT shared into accounts, and the
+# store is now the same directory -SeedInto copies from. Without excluding them
+# every seeded account gets a private copy of the profile script and the status
+# line - the second of which then silently stops tracking the shared one.
+$StoreOnlyDirs  = @('bin')
+$StoreOnlyFiles = @([IO.Path]::GetFileName($StatusLine))
+
 function Write-Step { param($Message) Write-Host "  $Message" }
 function Write-Head { param($Message) Write-Host "`n$Message" -ForegroundColor Cyan }
 function Write-Skip { param($Message) Write-Host "  - $Message" -ForegroundColor DarkGray }
@@ -541,14 +548,6 @@ if (-not $NoStatusLine) {
     }
 }
 
-# The store is also $SeedFrom now. Exclude the path-addressed status line from
-# the seeded account or robocopy would manufacture a per-account copy after the
-# shared copy was placed in ~/.claude above.
-$SeedExcludeFiles = @($SharedFiles)
-if ($StatusLineCommand) {
-    $SeedExcludeFiles += [IO.Path]::GetFileName($StatusLine)
-}
-
 # ----------------------------------------------------------- accounts --------
 
 foreach ($name in $Accounts) {
@@ -570,7 +569,8 @@ foreach ($name in $Accounts) {
             # below would have to decide whether the copy or the shared file
             # was the real one.
             Copy-Tree -Source $SeedFrom -Destination $acct `
-                      -ExcludeDirs ($SharedDirs + $SkipDirs) -ExcludeFiles $SeedExcludeFiles
+                      -ExcludeDirs ($SharedDirs + $SkipDirs + $StoreOnlyDirs) `
+                      -ExcludeFiles ($SharedFiles + $StoreOnlyFiles)
             Write-Done "config + credentials copied from $SeedFrom"
         }
         $srcJson = Join-Path $HOME '.claude.json'

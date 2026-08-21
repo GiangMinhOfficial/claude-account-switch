@@ -273,3 +273,23 @@ Describe 'Get-ClaudeAccount reports a CLAUDE.md that stopped being shared' {
         (Get-ClaudeAccount 6>&1 | Out-String -Width 500) | Should -Not -Match 'not shared'
     }
 }
+
+Describe 'setup-claude-accounts.ps1 keeps store-only artifacts out of accounts' {
+    BeforeEach { $script:FakeHome = New-MemoryFakeHome }
+    AfterEach  { Remove-MemoryFakeHome -Path $script:FakeHome }
+
+    It 'does not seed bin/ or statusline.sh into an account' {
+        # Both live in the store, and the store is now ~/.claude - the very
+        # directory -SeedInto copies from. Without an explicit exclusion every
+        # new account gets a private copy of the profile script and the bar.
+        $bin = Join-Path $script:FakeHome '.claude\bin'
+        $null = New-Item -ItemType Directory -Path $bin -Force
+        Set-Content -LiteralPath (Join-Path $bin 'claude-account-profile.ps1') -Value '# installed'
+        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude\statusline.sh') -Value '#!/bin/bash'
+
+        & $script:SetupScript -Accounts work -SeedInto work -NoStatusLine 6>&1 | Out-Null
+
+        Test-Path -LiteralPath (Join-Path $script:FakeHome '.claude-work\bin')           | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $script:FakeHome '.claude-work\statusline.sh') | Should -BeFalse
+    }
+}
