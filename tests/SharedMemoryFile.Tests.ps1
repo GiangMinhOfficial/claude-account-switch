@@ -232,7 +232,6 @@ Describe 'setup-claude-accounts.ps1 -DryRun with no CLAUDE.md anywhere' {
 Describe 'Get-ClaudeAccount reports a CLAUDE.md that stopped being shared' {
     BeforeEach {
         $script:FakeHome = New-MemoryFakeHome
-        & $script:SetupScript -Accounts work, personal -SeedInto work 6>&1 | Out-Null
         # Dot-source AFTER $HOME is fake: the profile registers launchers for
         # every account it can see at load time.
         . $script:ProfileFile
@@ -240,6 +239,8 @@ Describe 'Get-ClaudeAccount reports a CLAUDE.md that stopped being shared' {
     AfterEach { Remove-MemoryFakeHome -Path $script:FakeHome }
 
     It 'flags the account whose link an editor broke' {
+        & $script:SetupScript -Accounts work, personal -SeedInto work 6>&1 | Out-Null
+
         # Saving by write-new-then-rename replaces the link with a plain file.
         # Nothing else would ever say so: the account keeps a readable
         # CLAUDE.md that silently no longer follows the shared one.
@@ -254,6 +255,8 @@ Describe 'Get-ClaudeAccount reports a CLAUDE.md that stopped being shared' {
     }
 
     It 'still reports a missing login, and both tags together' {
+        & $script:SetupScript -Accounts work, personal -SeedInto work 6>&1 | Out-Null
+
         $link = Join-Path $script:FakeHome '.claude-personal\CLAUDE.md'
         Remove-Item -LiteralPath $link -Force
         Set-Content -LiteralPath $link -Value 'drifted' -Encoding utf8
@@ -263,12 +266,15 @@ Describe 'Get-ClaudeAccount reports a CLAUDE.md that stopped being shared' {
         $out | Should -Match 'personal\s+\(not logged in, CLAUDE\.md not shared\)'
     }
 
-    # SKIPPED until Task 3: the store path now exists whenever ~/.claude has
-    # CLAUDE.md, so that path alone cannot prove the file is actually shared.
-    It 'says nothing when CLAUDE.md is not a shared file at all' -Skip {
+    It 'says nothing when CLAUDE.md is not a shared file at all' {
         # Leaving CLAUDE.md out of -SharedFiles is a choice, not a fault, and
-        # must not flag every account on the machine.
-        Remove-Item -LiteralPath (Join-Path $script:FakeHome '.claude-shared\CLAUDE.md') -Force
+        # must not flag every account on the machine. The old sentinel was the
+        # existence of ~/.claude-shared/CLAUDE.md; with the store at ~/.claude
+        # that file's existence proves only that a memory file exists, so the
+        # gate has to infer intent from the links themselves.
+        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude\other.md') -Value 'other'
+        & $script:SetupScript -Accounts work,personal -SeedInto work `
+                              -SharedFiles other.md -NoStatusLine 6>&1 | Out-Null
 
         (Get-ClaudeAccount 6>&1 | Out-String -Width 500) | Should -Not -Match 'not shared'
     }

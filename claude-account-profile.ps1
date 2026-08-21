@@ -88,13 +88,22 @@ function Get-ClaudeAccount {
         Write-Host "current: $name  ->  $env:CLAUDE_CONFIG_DIR" -ForegroundColor Cyan
     }
 
-    # Only worth reporting on when shared memory is set up at all. Without this
-    # gate, anyone who left CLAUDE.md out of -SharedFiles gets every account
-    # flagged for a thing they chose.
-    $memoryIsShared = Test-Path -LiteralPath (Join-Path $HOME '.claude\CLAUDE.md') -PathType Leaf
+    # Is CLAUDE.md shared AT ALL on this machine? The old test was the presence
+    # of ~/.claude-shared/CLAUDE.md, which proved the user ASKED for it to be
+    # shared. With the store at ~/.claude that file's presence proves only that
+    # a memory file exists, so intent has to be inferred from the links: if any
+    # account still holds a name for the store's inode, sharing was set up.
+    #
+    # Blind spot, accepted deliberately: when EVERY account's link is broken at
+    # once this closes and the tag goes quiet. Distinguishing that from "never
+    # shared" needs a marker file, and the directory is the account here.
+    $accountDirs    = @(Get-ClaudeAccountDir)
+    $memoryIsShared = [bool](@($accountDirs | Where-Object {
+        Test-ClaudeSharedMemory -AccountDir $_.FullName
+    }).Count)
 
     Write-Host "available:"
-    Get-ClaudeAccountDir | ForEach-Object {
+    $accountDirs | ForEach-Object {
         $n = $_.Name -replace '^\.claude-', ''
 
         $tags = @()
