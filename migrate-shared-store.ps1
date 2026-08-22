@@ -178,3 +178,104 @@ if ($divergent.Count -gt 0) {
 Write-Done "CLAUDE.md is consistent across every account"
 
 Write-MigrationManifest -Accounts @($accounts | ForEach-Object { $_.FullName })
+
+# ------------------------------------------------------------ phase 1 --------
+
+# Every legacy file this run READ, with the size and timestamp it had at the
+# time. Phase 2b re-checks these: a change means something wrote during the run
+# and the merge is incomplete.
+$script:ReadFiles  = @{}
+$script:Conflicts  = @()
+$script:Copied     = 0
+$script:Overwrote  = 0
+
+function Register-ReadFile {
+    param([IO.FileInfo] $Item)
+    $script:ReadFiles[$Item.FullName] = [pscustomobject]@{
+        Length           = $Item.Length
+        LastWriteTimeUtc = $Item.LastWriteTimeUtc
+    }
+}
+
+function Copy-LegacyTree {
+    # Walks one legacy subtree and applies a per-source policy.
+    #   Missing      -> copy
+    #   Identical    -> skip
+    #   Differs      -> $OnConflict decides: 'keep-store' or 'legacy-wins'
+    # projects/ is handled separately in Phase 1b: transcripts need classifying,
+    # not a flat rule.
+    param(
+        [string] $Source,
+        [string] $Destination,
+        [ValidateSet('keep-store', 'legacy-wins')] [string] $OnConflict
+    )
+
+    if (-not (Test-Path -LiteralPath $Source)) { return }
+
+    Get-ChildItem -LiteralPath $Source -Recurse -File -Force -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            Register-ReadFile -Item $_
+            $relative = $_.FullName.Substring($Source.Length).TrimStart('\')
+            $target   = Join-Path $Destination $relative
+
+            if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
+                if ($DryRun) { Write-Step "would copy $relative"; return }
+                $parent = Split-Path $target -Parent
+                if (-not (Test-Path -LiteralPath $parent)) {
+                    $null = New-Item -ItemType Directory -Path $parent -Force
+                }
+                Copy-Item -LiteralPath $_.FullName -Destination $target -Force
+                $script:Copied++
+                return
+            }
+
+            if ((Get-FileHash -LiteralPath $_.FullName).Hash -eq
+                (Get-FileHash -LiteralPath $target).Hash) { return }
+
+            if ($OnConflict -eq 'legacy-wins') {
+                if ($DryRun) { Write-Step "would overwrite $relative"; return }
+                Copy-Item -LiteralPath $_.FullName -Destination $target -Force
+                $script:Overwrote++
+            } else {
+                $script:Conflicts += $target
+            }
+        }
+}
+
+Write-Head "Merge"
+
+foreach ($dir in @('skills', 'agents', 'commands', 'hooks')) {
+    Copy-LegacyTree -Source (Join-Path $Legacy $dir) -Destination (Join-Path $Store $dir) `
+                    -OnConflict 'keep-store'
+}
+
+# plugins/ is the one documented exception to never-overwrite. The legacy tree
+# is the one the accounts have actually been using, and its registry JSONs know
+# about plugins the store's stale copy does not. Overwrite and add; delete
+# nothing.
+Copy-LegacyTree -Source (Join-Path $Legacy 'plugins') -Destination (Join-Path $Store 'plugins') `
+                -OnConflict 'legacy-wins'
+
+# Store-only artifacts: they belong in the store but are never shared into an
+# account, so setup excludes them from seeding.
+Copy-LegacyTree -Source (Join-Path $Legacy 'bin') -Destination (Join-Path $Store 'bin') `
+                -OnConflict 'keep-store'
+
+$legacyStatusLine = Join-Path $Legacy 'statusline.sh'
+if (Test-Path -LiteralPath $legacyStatusLine -PathType Leaf) {
+    Register-ReadFile -Item (Get-Item -LiteralPath $legacyStatusLine -Force)
+    $target = Join-Path $Store 'statusline.sh'
+    if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
+        if ($DryRun) {
+            Write-Step "would copy statusline.sh"
+        } else {
+            Copy-Item -LiteralPath $legacyStatusLine -Destination $target -Force
+            Write-Done "statusline.sh"
+        }
+    }
+}
+
+# CLAUDE.md needs nothing: preflight already proved every name is one inode, so
+# the store's copy IS the legacy store's copy.
+
+Write-Done "$($script:Copied) copied, $($script:Overwrote) overwritten (plugins), $($script:Conflicts.Count) conflicts"

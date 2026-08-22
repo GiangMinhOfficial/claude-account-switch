@@ -132,3 +132,54 @@ Describe 'migrate-shared-store.ps1 preflight' {
             Should -Match 'claude-shared'
     }
 }
+
+Describe 'migrate-shared-store.ps1 merge' {
+    BeforeEach {
+        $script:FakeHome = New-LegacyFakeHome   # swaps $HOME AND $PROFILE
+        $script:Script   = Join-Path (Split-Path $PSScriptRoot -Parent) 'migrate-shared-store.ps1'
+        $null = New-LegacyAccount -Name work
+    }
+    AfterEach { Remove-LegacyFakeHome -Path $script:FakeHome }
+
+    It 'copies a file that exists only in the legacy store' {
+        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude-shared\skills\only-legacy.md') -Value 'legacy'
+
+        & $script:Script 6>&1 | Out-Null
+
+        Get-Content -LiteralPath (Join-Path $script:FakeHome '.claude\skills\only-legacy.md') |
+            Should -Be 'legacy'
+    }
+
+    It 'keeps the store copy when a non-transcript file differs' {
+        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude-shared\skills\both.md') -Value 'legacy'
+        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude\skills\both.md')        -Value 'store'
+
+        & $script:Script 6>&1 | Out-Null
+
+        Get-Content -LiteralPath (Join-Path $script:FakeHome '.claude\skills\both.md') | Should -Be 'store'
+    }
+
+    It 'lets the legacy plugins registry win, including overwrites' {
+        # plugins/ is a registry plus a content tree that must stay internally
+        # consistent. Never-overwrite would keep a stale registry and leave the
+        # freshly copied plugin trees unregistered.
+        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude-shared\plugins\installed_plugins.json') -Value '{"new":1}'
+        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude\plugins\installed_plugins.json')        -Value '{"old":1}'
+
+        & $script:Script 6>&1 | Out-Null
+
+        Get-Content -LiteralPath (Join-Path $script:FakeHome '.claude\plugins\installed_plugins.json') |
+            Should -Be '{"new":1}'
+    }
+
+    It 'copies bin/ and statusline.sh into the store' {
+        $null = New-Item -ItemType Directory -Path (Join-Path $script:FakeHome '.claude-shared\bin') -Force
+        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude-shared\bin\claude-account-profile.ps1') -Value '# p'
+        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude-shared\statusline.sh') -Value '#!/bin/bash'
+
+        & $script:Script 6>&1 | Out-Null
+
+        Test-Path -LiteralPath (Join-Path $script:FakeHome '.claude\bin\claude-account-profile.ps1') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $script:FakeHome '.claude\statusline.sh')                  | Should -BeTrue
+    }
+}
