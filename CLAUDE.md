@@ -4,10 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Three PowerShell scripts and one bash script — no build step, no package manager, no
+Four PowerShell scripts and one bash script — no build step, no package manager, no
 dependencies beyond the shell. They let one Windows machine run several Claude Code
 accounts by pointing `CLAUDE_CONFIG_DIR` at `~/.claude-<name>` per shell, while
-everything that should be common lives once in `~/.claude-shared`.
+everything that should be common lives once in `~/.claude`, which is both the shared
+store and the config dir used by a shell with no `CLAUDE_CONFIG_DIR`.
 
 Target shell is **Windows PowerShell 5.1**. No PowerShell 7-only syntax (`??`, `?:`,
 `-AsHashtable`, `&&`/`||`). `.gitattributes` pins `.ps1` and `.md` to CRLF and `.sh`
@@ -52,10 +53,11 @@ against a real `$HOME` can still abort on a pre-existing directory.
 
 | File | Runs | Role |
 | --- | --- | --- |
-| `setup-claude-accounts.ps1` | once per account, re-runnable | creates `~/.claude-shared`, the account dirs, and the links between them |
+| `setup-claude-accounts.ps1` | once per account, re-runnable | creates or repairs the shared store in `~/.claude`, the account dirs, and the links between them |
+| `migrate-shared-store.ps1` | once, to move a pre-merge machine over | merges the legacy store into `~/.claude`, retargets account junctions, then hands off to setup and install |
 | `claude-account-profile.ps1` | every shell, via `$PROFILE` | `Use-`/`Get-`/`Reset-`/`Rename-`/`Remove-ClaudeAccount` plus generated launchers |
-| `install.ps1` | once | copies the profile into `~/.claude-shared/bin` and adds a marked block to `$PROFILE` |
-| `statusline.sh` | per status line render, by Claude Code | the bar every account shows; copied into `~/.claude-shared` by setup |
+| `install.ps1` | once | copies the profile into `~/.claude/bin` and adds a marked block to `$PROFILE` |
+| `statusline.sh` | per status line render, by Claude Code | the bar every account shows; copied into `~/.claude` by setup |
 
 **The directory is the account.** There is no registry, alias table or rename log.
 `Get-ClaudeAccountDir` defines an account as a `~/.claude-*` directory that is not
@@ -64,10 +66,17 @@ unrelated dirs such as `.claude-mem`. It follows that an account Claude Code has
 run in has no `projects/`, so it gets no launchers and cannot be renamed. That is a
 known limitation of the whole profile, not a bug in any one function.
 
+The migration's `~/.claude/.migrate-shared-store.state` does not change that rule.
+It is transient, authoritative for nothing, and exists only to carry discovered
+account paths across the retargeting window. A clean run removes it; its presence
+afterwards means a migration did not finish.
+
 **Two link mechanisms, chosen by type, neither needing admin.** Directories listed in
-`-SharedDirs` become NTFS junctions (`mklink /J`); files listed in `-SharedFiles`
-(default `CLAUDE.md`) become hardlinks (`mklink /H`), because a junction cannot link a
-file. Real symlinks are deliberately unused — they require admin or Developer Mode.
+`-SharedDirs` become NTFS junctions from each account to `~/.claude/<dir>`
+(`mklink /J`); files listed in `-SharedFiles` (default `CLAUDE.md`) become hardlinks
+between `~/.claude/<file>` and each account (`mklink /H`), because a junction cannot
+link a file. Real symlinks are deliberately unused — they require admin or Developer
+Mode.
 
 The two are not interchangeable in code:
 
@@ -81,14 +90,14 @@ The two are not interchangeable in code:
 - Removing a hardlink name is always safe: it never touches the content behind the
   other names. That is why it is deliberately absent from the unlink pass.
 
-A hardlinked file has no "original". `~/.claude/CLAUDE.md`, `~/.claude-shared/CLAUDE.md`
-and every account's copy are equal names for one inode; `~/.claude` is the designated
-home for it by convention and because it is the fallback config dir, not because the
-filesystem privileges it.
+A hardlinked file has no "original". `~/.claude/CLAUDE.md` and every account's copy
+are equal names for one inode; `~/.claude` is the designated home for it by convention
+and because it is the fallback config dir, not because the filesystem privileges it.
 
 **The status line is shared a third way: by path, with no link.** `settings.json` is
 private per account, but its `statusLine` key names a *path*, so one copy of
-`statusline.sh` in the store serves everyone and setup only has to write that key.
+`statusline.sh` at `~/.claude/statusline.sh` serves everyone and setup only has to
+write that key.
 Consequences that shape the code:
 
 - The store copy is a **copy**, overwritten from the repo whenever the two differ.
@@ -104,15 +113,30 @@ Consequences that shape the code:
 - `statusLine` is merged, not replaced, so a `padding` the user set survives.
 - Setup writes `~/.claude/settings.json` too — it is the template a fresh account's
   settings are copied from, so skipping it would hand the next account the old bar.
-  That is the second of exactly two things setup writes into `~/.claude`, and both
-  are reported through `$SeedFromAdditions`/`$SeedFromEdits` so the closing summary
-  never claims more than it did.
+  The store is now the same path as `$SeedFrom`, so every store addition or edit —
+  shared directories and files, the status line and this setting — is reported
+  through `$SeedFromAdditions`/`$SeedFromEdits`; the closing summary never claims
+  more than setup did.
+
+**Store-only artifacts.** `bin/` and `statusline.sh` live in the store but are not
+shared into accounts. The store is also the directory `-SeedInto` copies from, so
+`$StoreOnlyDirs` and `$StoreOnlyFiles` exclude them from that seed. Without those
+exclusions each seeded account would get private copies, and its profile or status
+line could silently stop following the store copy.
+
+**`~/.claude` is load-bearing. Do not delete it to reset Claude Code.** It is the
+shared store: deleting it destroys every account's transcripts, skills and plugins
+at once, leaves every junction dangling, and removes the installed profile under
+`~/.claude/bin`. Before the merge, `rm -rf ~/.claude` cost you the fallback config
+and nothing else. That is no longer true.
 
 **The invalid-name class is duplicated on purpose.**
 `$ClaudeInvalidNameClass = '[\\/:*?"<>|\[\]]'` appears in both the setup script and the
 profile rather than being shared, because dot-sourcing the setup script from the profile
 would run a whole setup routine at shell start. `tests/Set-ClaudeAccountName.Tests.ps1`
-extracts both by regex and asserts they are identical — keep them in sync.
+extracts both by regex and asserts they are identical — keep them in sync. These are
+exactly the two copies: migration discovers accounts from disk and takes no account
+name input, so do not add a third copy there.
 
 ## PowerShell provider hazards this code is built around
 
@@ -148,7 +172,7 @@ deliberately does not, because a rename is reversible and must not prompt.
 
 ## Tests
 
-`tests/Fixtures.ps1` plus four `*.Tests.ps1` files.
+`tests/Fixtures.ps1` plus five `*.Tests.ps1` files.
 
 - Fixtures swap the **global `$HOME`** to a real temp directory — not `TestDrive:`,
   because `mklink` cannot resolve a PSDrive path. It is restored in `AfterAll`/
@@ -175,4 +199,4 @@ deliberately does not, because a rename is reversible and must not prompt.
   `docs/superpowers/`, committed before the code — see the `Rename-ClaudeAccount` spec
   and plan, and the review-pass commits that hardened them.
 - Nothing account-specific belongs in this repo; account data lives only in
-  `~/.claude-<name>` and `~/.claude-shared`.
+  `~/.claude` and `~/.claude-<name>`.

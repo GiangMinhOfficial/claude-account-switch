@@ -1,7 +1,7 @@
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0' }
 
 # The status line is the one shared thing with no link behind it: Claude Code
-# names it by PATH in settings.json, so a single copy in ~/.claude-shared is
+# names it by PATH in settings.json, so a single copy in ~/.claude is
 # enough and every account's settings.json is pointed at it. What has to be
 # tested instead is the EDIT: settings.json is a file Claude Code owns and the
 # user hand-edits, so the one key must change and nothing else may - not the
@@ -101,7 +101,7 @@ Describe 'setup-claude-accounts.ps1 shares the status line' {
     It 'keeps one copy of the script in the shared store and points every account at it' {
         $null = & $script:SetupScript -Accounts work,personal -SeedInto work 6>&1
 
-        $shared = Join-Path $script:FakeHome '.claude-shared\statusline.sh'
+        $shared = Join-Path $script:FakeHome '.claude\statusline.sh'
         Test-Path -LiteralPath $shared | Should -BeTrue
         (Get-FileHash -LiteralPath $shared).Hash |
             Should -Be (Get-FileHash -LiteralPath $script:StatusLineScript).Hash
@@ -159,6 +159,34 @@ Describe 'setup-claude-accounts.ps1 shares the status line' {
         (Get-FileHash -LiteralPath $path).Hash | Should -Be $before
     }
 
+    It 'reports the statusline.sh it rewrote in the store rather than claiming nothing changed' {
+        # The store IS ~/.claude, so overwriting statusline.sh there modifies it.
+        # The copy is recorded in neither list, so a re-run whose ONLY change is
+        # that copy printed "Your original ~/.claude was not modified".
+        & $script:SetupScript -Accounts work -SeedInto work 6>&1 | Out-Null
+        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude\statusline.sh') `
+                    -Value '# stale - differs from the repo copy' -Encoding utf8
+
+        # Second run: dirs already seeded, CLAUDE.md already linked, settings.json
+        # already correct. Only the status-line copy fires.
+        $out = & $script:SetupScript -Accounts work -NoSeed 6>&1 | Out-String -Width 500
+
+        # Assert on the change being REPORTED, not on the absence of a phrase -
+        # this task deletes that phrase, so a negative-only assertion would pass
+        # for the wrong reason.
+        $out | Should -Match 'This run changed:.*statusline\.sh'
+        $out | Should -Not -Match 'not modified'
+
+        [IO.File]::WriteAllText(
+            (Join-Path $script:FakeHome '.claude\statusline.sh'),
+            '# stale again for dry run',
+            (New-Object Text.UTF8Encoding $false)
+        )
+        $dryOut = & $script:SetupScript -Accounts work -NoSeed -DryRun 6>&1 |
+                      Out-String -Width 500
+        $dryOut | Should -Match 'This run would change:.*statusline\.sh'
+    }
+
     It 'replaces a status line the account already had, and says what it was' {
         $out = & $script:SetupScript -Accounts work -SeedInto work 6>&1 | Out-String -Width 500
 
@@ -185,7 +213,7 @@ Describe 'setup-claude-accounts.ps1 shares the status line' {
 
         $out = & $script:SetupScript -Accounts work -NoSeed 6>&1 | Out-String -Width 500
 
-        $out | Should -Not -Match 'Your original ~/\.claude was not modified'
+        $out | Should -Not -Match 'Nothing in .* was added or changed\.'
         $out | Should -Match 'settings\.json \(created, to hold the status line\)'
     }
 
@@ -196,7 +224,7 @@ Describe 'setup-claude-accounts.ps1 shares the status line' {
         $null = & $script:SetupScript -Accounts work -SeedInto work -NoStatusLine 6>&1
 
         (Get-FileHash -LiteralPath $path).Hash | Should -Be $before
-        Test-Path -LiteralPath (Join-Path $script:FakeHome '.claude-shared\statusline.sh') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $script:FakeHome '.claude\statusline.sh') | Should -BeFalse
         (Get-StatusLineCommand -SettingsPath (Join-Path $script:FakeHome '.claude-work\settings.json')) |
             Should -Be 'node old-statusline.js'
     }
@@ -208,7 +236,7 @@ Describe 'setup-claude-accounts.ps1 shares the status line' {
         $out = & $script:SetupScript -Accounts work -SeedInto work -DryRun 6>&1 | Out-String -Width 500
 
         (Get-FileHash -LiteralPath $path).Hash | Should -Be $before
-        Test-Path -LiteralPath (Join-Path $script:FakeHome '.claude-shared') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $script:FakeHome '.claude\statusline.sh') | Should -BeFalse
         $out | Should -Match 'would copy .*statusline\.sh'
         $out | Should -Match 'would replace the status line'
     }

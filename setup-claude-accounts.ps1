@@ -7,30 +7,26 @@
     Each account gets its own config dir (~/.claude-<name>) holding its own
     .credentials.json and .claude.json, so logins are fully separate.
 
-    Directories that should be common to every account (session transcripts,
-    skills, agents, plugins, ...) live once in ~/.claude-shared and are exposed
-    to each account through an NTFS directory junction. One copy of truth --
-    no syncing, no divergence.
+    ~/.claude is the shared store as well as the config dir used by a shell
+    with no CLAUDE_CONFIG_DIR. Directories that should be common to every
+    account (session transcripts, skills, agents, plugins, ...) live there once
+    and are exposed to each account through an NTFS directory junction. One
+    copy of truth -- no syncing, no divergence.
 
     Your global memory file, CLAUDE.md, gets the same treatment. It is a FILE,
     and a junction only links directories, so it is shared with an NTFS
-    hardlink instead. The real file stays in ~/.claude; the shared store and
-    every account hold additional names for that same inode, so editing
-    CLAUDE.md from any account edits it for all of them.
+    hardlink instead. The real file stays in the ~/.claude store and every
+    account holds an additional name for that same inode, so editing CLAUDE.md
+    from any account edits it for all of them.
 
     The status line is shared a third way, because it needs no link at all:
     Claude Code names it by PATH in settings.json. One copy of statusline.sh
-    lives in ~/.claude-shared and every account's settings.json points at it,
+    lives in ~/.claude and every account's settings.json points at it,
     so all accounts show the same bar and one edit changes them all.
 
-    This script never deletes anything from ~/.claude. Your existing setup
-    stays intact as a fallback: a shell with no CLAUDE_CONFIG_DIR set still
-    uses it. It writes there in exactly two places: an empty
-    ~/.claude/CLAUDE.md is created if you have none at all, so the shared
-    memory file has somewhere to be a second name for, and the statusLine key
-    of ~/.claude/settings.json is pointed at the shared script - that file is
-    the template every new account's settings are seeded from, so leaving it
-    behind would hand the next account the old status line.
+    Setup only ever adds to ~/.claude; it never deletes. Existing config stays
+    usable by the fallback shell while also becoming the one shared store for
+    every named account.
 
 .EXAMPLE
     .\setup-claude-accounts.ps1 -DryRun
@@ -117,10 +113,22 @@ foreach ($name in $Accounts) {
     }
 }
 
-$Shared = Join-Path $HOME '.claude-shared'
+# The store IS ~/.claude. It holds the real shared dirs, CLAUDE.md,
+# statusline.sh and bin/, and every account junctions/hardlinks into it.
+# It is also the config dir a shell with no CLAUDE_CONFIG_DIR falls back to,
+# so $Shared and $SeedFrom are normally the SAME path - several guards below
+# exist only because of that overlap and say so.
+$Shared = Join-Path $HOME '.claude'
 
 # Ephemeral/regenerable - not worth copying into the seeded account
 $SkipDirs = @('shell-snapshots', 'debug', 'paste-cache', 'downloads', 'cache', 'backups')
+
+# Store-only: these live in the store but are NOT shared into accounts, and the
+# store is now the same directory -SeedInto copies from. Without excluding them
+# every seeded account gets a private copy of the profile script and the status
+# line - the second of which then silently stops tracking the shared one.
+$StoreOnlyDirs  = @('bin')
+$StoreOnlyFiles = @([IO.Path]::GetFileName($StatusLine))
 
 function Write-Step { param($Message) Write-Host "  $Message" }
 function Write-Head { param($Message) Write-Host "`n$Message" -ForegroundColor Cyan }
@@ -196,6 +204,28 @@ function Test-BlankFile {
     # A file holding only a BOM and blank lines is what an editor leaves behind
     # after you open a new memory file and save without typing anything.
     return [string]::IsNullOrWhiteSpace((Get-Content -LiteralPath $Path -Raw))
+}
+
+function Find-SharedFilePeer {
+    # A surviving name for a shared file's inode, found among the account dirs.
+    #
+    # When the store was a separate directory it was itself the recovery handle:
+    # ~/.claude could lose its copy and be re-linked from ~/.claude-shared. Now
+    # that those are one path, the accounts are the only other names, so they
+    # are where a deleted store file has to be recovered from.
+    param([string] $FileName, [string] $Store)
+
+    if (-not (Test-Path -LiteralPath $Store)) { return $null }
+    $storeFull = (Get-Item -LiteralPath $Store -Force).FullName.TrimEnd('\')
+    Get-ChildItem -Path $HOME -Directory -Filter '.claude-*' -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName.TrimEnd('\') -ne $storeFull } |
+        ForEach-Object {
+            $candidate = Join-Path $_.FullName $FileName
+            if ((Test-Path -LiteralPath $candidate -PathType Leaf) -and
+                -not (Test-BlankFile -Path $candidate)) {
+                return $candidate
+            }
+        } | Select-Object -First 1
 }
 
 function Test-SameContent {
@@ -407,6 +437,13 @@ if ($SeedInto -and ($Accounts -notcontains $SeedInto)) {
 
 Write-Head "Shared store"
 
+# Anything this run puts INTO the store, or changes there. The store is now
+# ~/.claude itself, so this covers the shared dirs and statusline.sh as well as
+# the shared files - a summary that only counted the last of those could claim
+# nothing was modified after modifying it.
+$SeedFromAdditions = @()
+$SeedFromEdits     = @()
+
 if (-not (Test-Path -LiteralPath $Shared)) {
     if (-not $DryRun) { $null = New-Item -ItemType Directory -Path $Shared -Force }
     Write-Done "created $Shared"
@@ -425,17 +462,13 @@ foreach ($dir in $SharedDirs) {
     if (Test-Path -LiteralPath $origin) {
         Copy-Tree -Source $origin -Destination $target
         Write-Done "$dir (copied from current config)"
+        $SeedFromAdditions += "$dir/"
     } else {
         if (-not $DryRun) { $null = New-Item -ItemType Directory -Path $target -Force }
         Write-Done "$dir (created empty)"
+        $SeedFromAdditions += "$dir/"
     }
 }
-
-# Anything this run puts INTO $SeedFrom, or changes there, so the closing
-# summary can say so rather than repeating a "nothing was modified" line that
-# stopped being true.
-$SeedFromAdditions = @()
-$SeedFromEdits     = @()
 
 foreach ($file in $SharedFiles) {
     $target = Join-Path $Shared   $file
@@ -460,6 +493,18 @@ foreach ($file in $SharedFiles) {
         } else {
             Write-Skip "$file (no $SeedFrom to link it back into)"
         }
+    } elseif ($peer = Find-SharedFilePeer -FileName $file -Store $Shared) {
+        # The store's name is gone but the inode is alive under an account's
+        # name. Re-link rather than creating an empty file: an empty store file
+        # would make the per-account pass below hit New-FileLink's refusal on
+        # every account that still has content, aborting the run.
+        if ($DryRun) {
+            Write-Step "would re-link $file into $Shared from $peer"
+        } else {
+            New-FileLink -Link $target -Target $peer
+            Write-Done "$file (recovered from $peer)"
+        }
+        $SeedFromAdditions += $file
     } elseif (Test-Path -LiteralPath $SeedFrom) {
         # The one thing this script adds to ~/.claude, and only when you have
         # no $file at all: the shared copy needs a real file to be a name for.
@@ -513,9 +558,11 @@ if (-not $NoStatusLine) {
             Write-Skip "up to date $target"
         } elseif ($DryRun) {
             Write-Step "would copy $StatusLine -> $target"
+            $SeedFromEdits += [IO.Path]::GetFileName($StatusLine)
         } else {
             Copy-Item -LiteralPath $StatusLine -Destination $target -Force
             Write-Done "copied $([IO.Path]::GetFileName($StatusLine)) -> $Shared"
+            $SeedFromEdits += [IO.Path]::GetFileName($StatusLine)
         }
 
         # Forward slashes, and each half quoted: this string is embedded in
@@ -561,7 +608,8 @@ foreach ($name in $Accounts) {
             # below would have to decide whether the copy or the shared file
             # was the real one.
             Copy-Tree -Source $SeedFrom -Destination $acct `
-                      -ExcludeDirs ($SharedDirs + $SkipDirs) -ExcludeFiles $SharedFiles
+                      -ExcludeDirs ($SharedDirs + $SkipDirs + $StoreOnlyDirs) `
+                      -ExcludeFiles ($SharedFiles + $StoreOnlyFiles)
             Write-Done "config + credentials copied from $SeedFrom"
         }
         $srcJson = Join-Path $HOME '.claude.json'
@@ -608,7 +656,7 @@ if ($SeedFromAdditions.Count -gt 0 -or $SeedFromEdits.Count -gt 0) {
         Write-Host "  This run $($changed): $($SeedFromEdits -join ', ')"
     }
 } else {
-    Write-Host "  Your original ~/.claude was not modified."
+    Write-Host "  Nothing in $SeedFrom was added or changed."
 }
 Write-Host ""
 Write-Host "  Next - open a NEW shell, then:"
