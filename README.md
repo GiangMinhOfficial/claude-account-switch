@@ -4,7 +4,14 @@ Run multiple Claude Code accounts on Windows. Each account keeps its own login;
 all accounts share one set of session transcripts, skills, agents, plugins and
 one global `CLAUDE.md`.
 
-No admin rights. Nothing is ever deleted from your existing `~/.claude`.
+No admin rights. Setup never removes existing data from `~/.claude`.
+
+**`~/.claude` is load-bearing. Do not delete it to reset Claude Code.** It is
+both the fallback config and the shared store: deleting it destroys every
+account's transcripts, skills and plugins at once, leaves every junction
+dangling, and removes the installed profile script under `~/.claude/bin`.
+Before this store merge, deleting `~/.claude` cost the fallback config and
+nothing else. That is no longer true.
 
 ---
 
@@ -31,14 +38,14 @@ follows the config dir:
 | `settings.json`     | `join(configDir, "settings.json")`                     | yes                  |
 
 Because `projects/` is isolated too, accounts would not see each other's history.
-So the directories that _should_ be common live once in `~/.claude-shared` and are
-exposed to every account through an NTFS **directory junction** — one copy of truth,
-no syncing, no divergence.
+So the directories that _should_ be common live once in `~/.claude` — the fallback
+config doubles as the shared store — and are exposed to every named account through
+an NTFS **directory junction**. One copy of truth, no syncing, no divergence.
 
 `CLAUDE.md` — your global memory — follows the config dir in exactly the same way,
 but it is a _file_, and a junction only links directories. It gets an NTFS
-**hardlink** instead: the real file stays in `~/.claude`, and the store and every
-account hold additional names for that same inode. Editing it from any account
+**hardlink** instead: the file lives in the `~/.claude` store, and every named
+account holds an additional name for that same inode. Editing it from any account
 edits it for all of them, because there is only one of it.
 
 The status line needs no link at all. `settings.json` stays private per account —
@@ -47,13 +54,10 @@ each has its own model, theme and hooks — but the one key that should not diff
 and setup points every account's `settings.json` at that copy.
 
 ```
-~/.claude/                 <- the default config dir, still a working fallback
-    CLAUDE.md              <- the real global memory file lives here
-    settings.json          (private, but its statusLine points at the store)
-
-~/.claude-shared/          <- the single real copy of everything else
+~/.claude/                 <- shared store AND the default fallback config
     projects/  skills/  agents/  commands/  hooks/  plugins/
-    CLAUDE.md -> another name for ~/.claude/CLAUDE.md   (hardlink)
+    CLAUDE.md              <- the one global memory inode
+    settings.json          (private fallback config; statusLine points below)
     statusline.sh          <- the one status line script, run by every account
     bin/claude-account-profile.ps1        (installed by install.ps1)
 
@@ -62,8 +66,8 @@ and setup points every account's `settings.json` at that copy.
     .claude.json           (private)
     settings.json          (private, but its statusLine points at the store)
     sessions/  history.jsonl  cache/ ...   (private)
-    projects/ -> ~/.claude-shared/projects        (junction)
-    skills/   -> ~/.claude-shared/skills          (junction)
+    projects/ -> ~/.claude/projects               (junction)
+    skills/   -> ~/.claude/skills                 (junction)
     CLAUDE.md -> the same inode as ~/.claude/CLAUDE.md   (hardlink)
     ...
 
@@ -74,6 +78,11 @@ A hardlink has no "original": every name for the file is equal, and deleting one
 name never touches the content behind the others. That is why `~/.claude` can keep
 the file while every account still reads and writes it.
 
+`bin/` and `statusline.sh` are **store-only artifacts**. They live in `~/.claude`
+but are deliberately excluded when `-SeedInto` copies the rest of that same
+directory into an account; otherwise the account would get private copies that
+silently stop following the installed profile and shared status line.
+
 ---
 
 ## Requirements
@@ -82,8 +91,8 @@ the file while every account still reads and writes it.
 - Claude Code installed and on `PATH`
 - No administrator rights (junctions via `mklink /J` and hardlinks via `mklink /H`,
   unlike real symlinks — which is why neither mechanism here is a symlink)
-- NTFS, with `~/.claude`, `~/.claude-shared` and the accounts on one volume. A
-  hardlink cannot cross volumes; junctions can, but nothing here needs them to.
+- NTFS, with `~/.claude` and the accounts on one volume. A hardlink cannot cross
+  volumes; junctions can, but nothing here needs them to.
 - For the shared status line only: **Git Bash** and **Node.js**, which is what
   `statusline.sh` runs on. Setup finds them itself and skips the status line with a
   warning if either is missing; everything else works without them. Pass
@@ -124,7 +133,7 @@ in to both accounts separately:
 .\install.ps1
 ```
 
-This copies `claude-account-profile.ps1` to `~/.claude-shared/bin/` and adds a marked
+This copies `claude-account-profile.ps1` to `~/.claude/bin/` and adds a marked
 block to your `$PROFILE` that dot-sources it — so the repo checkout can be moved or
 deleted afterwards. Re-run `.\install.ps1` after a `git pull` to pick up changes, or
 use `.\install.ps1 -FromRepo` to dot-source the repo copy directly and skip that step.
@@ -137,6 +146,48 @@ claude-personal    # run /login once, then exit
 ```
 
 That is the whole setup. `/login` uses the normal OAuth flow.
+
+---
+
+## Migrating from an older setup
+
+If you already have `~/.claude-shared`, move it into `~/.claude` once:
+
+```powershell
+.\migrate-shared-store.ps1 -DryRun   # read the plan first
+.\migrate-shared-store.ps1
+```
+
+**Close every Claude Code session first.** Nothing enforces this precondition. The
+script rechecks the whole legacy tree after merging and detects a file that was
+created, changed or removed during the run, but it cannot prevent a write.
+
+The script preflights every legacy and account `CLAUDE.md`, merges the legacy tree
+into the store, retargets the account junctions, then hands off to
+`setup-claude-accounts.ps1` and `install.ps1`. It never deletes
+`~/.claude-shared`: the old store stays on disk as a full standby copy, and removing
+it is your decision.
+
+For `skills/`, `agents/`, `commands/`, `hooks/` and `bin/`, missing legacy files are
+copied while a differing store copy is kept and reported as a conflict. The legacy
+`plugins/` tree is the exception: it wins because its registries record what the
+accounts were actually using. For project transcripts, a valid legacy continuation
+is adopted, a superseded copy is skipped, and a fork is rescued under a deterministic
+new session id so both histories remain resumable.
+
+After a real run, deletion guidance appears only after a passed preflight, no detected
+drift, no unresolved conflicts, no refused real directories or unexpected junction
+targets, and a completed handoff (setup, when there are accounts, plus mandatory
+install). Otherwise the run names what failed and withholds that guidance. Even after
+a clean report, open a **new** shell and confirm `Get-ClaudeAccount` still works before
+deleting anything: the current shell's `$PROFILE` may still point into
+`~/.claude-shared/bin` until `install.ps1` has run and the new shell loads the updated
+block.
+
+A real run writes `~/.claude/.migrate-shared-store.state` while it works. That
+manifest is transient and authoritative for nothing; a clean run removes it. If it
+is still present, a run did not finish, so keep the standby store and rerun the
+migration after fixing the reported condition.
 
 ---
 
@@ -201,7 +252,6 @@ Setup hardlinks it, so all of these are one file:
 
 ```
 ~/.claude/CLAUDE.md              <- the real file
-~/.claude-shared/CLAUDE.md       <- another name for it
 ~/.claude-work/CLAUDE.md         <- another name for it
 ~/.claude-personal/CLAUDE.md     <- another name for it
 ```
@@ -251,14 +301,14 @@ The first segment is the account. The script derives it from `CLAUDE_CONFIG_DIR`
 run time (`.claude-work` → `work`, unset → `default`), which is what lets a single
 script serve every account: it labels itself correctly wherever it runs.
 
-Setup copies it to `~/.claude-shared/statusline.sh` and writes the `statusLine` key
+Setup copies it to `~/.claude/statusline.sh` and writes the `statusLine` key
 of every account's `settings.json` — plus `~/.claude`'s, because that file is the
 template each new account is seeded from:
 
 ```json
 "statusLine": {
   "type": "command",
-  "command": "\"C:/Program Files/Git/bin/bash.exe\" \"C:/Users/you/.claude-shared/statusline.sh\""
+  "command": "\"C:/Program Files/Git/bin/bash.exe\" \"C:/Users/you/.claude/statusline.sh\""
 }
 ```
 
@@ -280,7 +330,7 @@ it back.
 
 **The store copy is a copy, not a link.** To change the bar, edit `statusline.sh` in
 this repo and re-run setup — a run overwrites the store copy whenever the two differ.
-Editing `~/.claude-shared/statusline.sh` directly works and takes effect immediately
+Editing `~/.claude/statusline.sh` directly works and takes effect immediately
 for every account, but the next setup run will overwrite it.
 
 To leave every `settings.json` alone:
@@ -321,7 +371,7 @@ Rename-ClaudeAccount personal work
 
 `~/.claude-personal` becomes `~/.claude-work`, the `personal` launchers are dropped
 and the `work` ones generated. The junctions inside are absolute paths into
-`~/.claude-shared`, so shared history is unaffected. There is no alias layer — the
+`~/.claude`, so shared history is unaffected. There is no alias layer — the
 directory is the account's name.
 
 Three things to know:
@@ -329,7 +379,7 @@ Three things to know:
 - **Other open shells keep the old launchers.** They loaded the profile into memory
   and nothing on disk can change that. Open a new shell after renaming.
   If you installed with `.\install.ps1` (the default), re-run it after pulling
-  changes — `$PROFILE` loads the copy in `~/.claude-shared/bin/`, not the repo.
+  changes — `$PROFILE` loads the copy in `~/.claude/bin/`, not the repo.
 - **Do not rename an account that has a live Claude Code session.** Claude Code
   writes and closes rather than holding handles, so the rename usually _succeeds_ —
   and the running process, still holding the old `CLAUDE_CONFIG_DIR`, recreates the
@@ -350,16 +400,15 @@ Three things to know:
 
 ## Safety notes
 
-- **Nothing in your original `~/.claude` is removed.** It stays as a working
-  fallback: any shell without `CLAUDE_CONFIG_DIR` set uses it. Setup writes there in
-  exactly two places, and says so both times. It _adds_ an empty `CLAUDE.md` if you
-  have none at all — a hardlink needs a real file to be a second name for, and
-  `~/.claude` is where that file belongs. And it _changes_ the `statusLine` key of
-  `~/.claude/settings.json`, because that file is the template new accounts are
-  seeded from; `-NoStatusLine` skips it.
-- **That fallback is also the main gotcha.** A plain `claude` in a fresh shell writes
-  sessions to `~/.claude/projects`, which is _not_ the shared store — those sessions
-  will not appear on your accounts. Launch through `claude-<name>` to stay consistent.
+- **Setup only adds to `~/.claude`; it never deletes from it.** The old promise that
+  it wrote there in exactly two places no longer applies because `~/.claude` is the
+  store. Setup can create missing shared directories and `CLAUDE.md`, copy
+  `statusline.sh`, and add or replace the `statusLine` setting. Its closing summary
+  reports every addition and edit; `-NoStatusLine` skips the last two.
+- **The fallback now participates in shared history.** A plain `claude` in a fresh
+  shell reads and writes the real shared `~/.claude/projects`, `skills` and `plugins`
+  directories. Its login and other top-level config are still the fallback's own;
+  launch through `claude-<name>` when the account identity matters.
 - **Credentials are plaintext.** Each `~/.claude-<name>/.credentials.json` holds OAuth
   access and refresh tokens, exactly as stock Claude Code does. Having several means
   one leak exposes several accounts. Keep them out of any backup or cloud-sync folder.
@@ -392,8 +441,9 @@ Three things to know:
 Remove-ClaudeAccount work     # then each account, if you want them gone
 ```
 
-`-Uninstall` leaves `~/.claude-shared` and every account directory untouched. Once no
-account junctions point at it any more, delete `~/.claude-shared` by hand.
+`-Uninstall` removes only the marked `$PROFILE` block. It leaves `~/.claude/bin` and
+every account directory untouched. Do not delete `~/.claude`: it remains both the
+fallback config and the shared store even after the shell functions are uninstalled.
 
 ---
 
@@ -469,7 +519,7 @@ then re-run setup. Pass `-NoStatusLine` if you do not want a status line at all.
 Run the command from `settings.json` by hand to see the error:
 
 ```powershell
-'{}' | & "C:\Program Files\Git\bin\bash.exe" "$HOME\.claude-shared\statusline.sh"
+'{}' | & "C:\Program Files\Git\bin\bash.exe" "$HOME\.claude\statusline.sh"
 ```
 
 The usual causes are Node.js missing from `PATH` (the script parses its JSON input
