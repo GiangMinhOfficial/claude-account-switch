@@ -107,4 +107,74 @@ if ($accounts.Count -eq 0) {
 } else {
     foreach ($a in $accounts) { Write-Step $a.Name }
 }
+
+# ----------------------------------------------------------- phase 0b --------
+
+function Test-SameInode {
+    # Two paths, one inode. Hardlinks are symmetric, so FileInfo.Target lists
+    # every OTHER name and can return them volume-relative.
+    param([string] $Path, [string] $Other)
+
+    if (-not (Test-Path -LiteralPath $Path  -PathType Leaf)) { return $false }
+    if (-not (Test-Path -LiteralPath $Other -PathType Leaf)) { return $false }
+
+    $item      = Get-Item -LiteralPath $Path  -Force
+    $otherFull = (Get-Item -LiteralPath $Other -Force).FullName
+    if ($item.FullName -eq $otherFull) { return $true }
+    if ($item.LinkType -ne 'HardLink')  { return $false }
+
+    foreach ($peer in @($item.Target)) {
+        if ([string]::IsNullOrWhiteSpace($peer)) { continue }
+        if ($peer -notmatch '^[A-Za-z]:\\' -and $peer -notmatch '^\\\\') {
+            $peer = (Split-Path -Qualifier $item.FullName) + $peer
+        }
+        if ($peer -eq $otherFull) { return $true }
+    }
+    return $false
+}
+
+Write-Head "Preflight"
+
+$storeMemory = Join-Path $Store 'CLAUDE.md'
+$divergent   = @()
+
+function Test-DivergentMemory {
+    # Nonblank, not the same inode as the store's copy, and not byte-identical
+    # to it. Anything matching is content that merging would silently drop.
+    param([string] $Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    if (Test-SameInode -Path $Path -Other $storeMemory)     { return $false }
+    if ([string]::IsNullOrWhiteSpace((Get-Content -LiteralPath $Path -Raw))) { return $false }
+    if ((Test-Path -LiteralPath $storeMemory -PathType Leaf) -and
+        ((Get-Content -LiteralPath $Path -Raw) -eq
+         (Get-Content -LiteralPath $storeMemory -Raw))) { return $false }
+    return $true
+}
+
+# The LEGACY copy is checked too, and it is the easier one to lose. Phase 1
+# skips CLAUDE.md entirely on the grounds that every name is one inode - so if
+# ~/.claude-shared/CLAUDE.md has drifted into an independent file, its content
+# is never merged, and a clean run would go on to say the legacy store is safe
+# to delete. That is the live shared-memory path today, so it is exactly the
+# one an editor is most likely to have replaced on save.
+if (Test-DivergentMemory -Path (Join-Path $Legacy 'CLAUDE.md')) {
+    $divergent += (Join-Path $Legacy 'CLAUDE.md')
+}
+
+foreach ($acct in $accounts) {
+    $acctMemory = Join-Path $acct.FullName 'CLAUDE.md'
+    if (Test-DivergentMemory -Path $acctMemory) { $divergent += $acctMemory }
+}
+
+if ($divergent.Count -gt 0) {
+    # Refuse BEFORE anything is mutated. setup's New-FileLink would refuse
+    # later anyway, but only after Phase 2 had already retargeted the
+    # junctions - and every re-run would then fail the same way.
+    throw ("Refusing to migrate: these CLAUDE.md files have content of their own`n" +
+           ($divergent | ForEach-Object { "         $_" }) -join "`n") + "`n" +
+          "       Merge what you want to keep into $storeMemory, delete the copy, then re-run."
+}
+Write-Done "CLAUDE.md is consistent across every account"
+
 Write-MigrationManifest -Accounts @($accounts | ForEach-Object { $_.FullName })

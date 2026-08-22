@@ -72,3 +72,63 @@ Describe 'migrate-shared-store.ps1 discovery' {
             Should -Match 'claude-shared'
     }
 }
+
+Describe 'migrate-shared-store.ps1 preflight' {
+    BeforeEach {
+        $script:FakeHome = New-LegacyFakeHome   # swaps $HOME AND $PROFILE
+        $script:Script   = Join-Path (Split-Path $PSScriptRoot -Parent) 'migrate-shared-store.ps1'
+    }
+    AfterEach { Remove-LegacyFakeHome -Path $script:FakeHome }
+
+    It 'aborts on a divergent account CLAUDE.md without mutating anything' {
+        # Editor replace-on-save turns a hardlink into a plain file. If that
+        # divergence is not caught up front, Phase 2 retargets the junctions and
+        # THEN setup's New-FileLink throws - leaving a half-migrated machine
+        # that every re-run fails on identically.
+        $acct = New-LegacyAccount -Name work
+        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude\CLAUDE.md') -Value 'store memory'
+        Set-Content -LiteralPath (Join-Path $acct 'CLAUDE.md') -Value 'DIVERGENT account memory'
+
+        { & $script:Script 6>&1 | Out-Null } | Should -Throw -ExpectedMessage '*CLAUDE.md*'
+
+        # Nothing mutated: the junction still points at the legacy store and
+        # discovery did not persist its interruption manifest.
+        (Get-Item -LiteralPath (Join-Path $acct 'projects') -Force).Target |
+            Should -Match 'claude-shared'
+        Test-Path -LiteralPath (Join-Path $script:FakeHome '.claude\.migrate-shared-store.state') |
+            Should -BeFalse
+    }
+
+    It 'accepts an account whose CLAUDE.md is a true hardlink peer' {
+        $acct = New-LegacyAccount -Name work
+        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude\CLAUDE.md') -Value 'store memory'
+        $null = cmd /c mklink /H "$acct\CLAUDE.md" "$(Join-Path $script:FakeHome '.claude\CLAUDE.md')"
+
+        { & $script:Script -DryRun 6>&1 | Out-Null } | Should -Not -Throw
+    }
+
+    It 'accepts an account with no CLAUDE.md at all' {
+        $null = New-LegacyAccount -Name work
+        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude\CLAUDE.md') -Value 'store memory'
+
+        { & $script:Script -DryRun 6>&1 | Out-Null } | Should -Not -Throw
+    }
+
+    It 'aborts when only the LEGACY CLAUDE.md has diverged' {
+        # The easiest copy to lose: Phase 1 skips CLAUDE.md entirely, so unique
+        # content here is never merged, and a clean run would then declare the
+        # legacy store safe to delete. ~/.claude-shared/CLAUDE.md is the live
+        # shared-memory path today, so it is the likeliest one an editor
+        # replaced on save.
+        $acct = New-LegacyAccount -Name work
+        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude\CLAUDE.md') -Value 'store memory'
+        $null = cmd /c mklink /H "$acct\CLAUDE.md" "$(Join-Path $script:FakeHome '.claude\CLAUDE.md')"
+        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude-shared\CLAUDE.md') `
+                    -Value 'DIVERGENT legacy memory nobody else has'
+
+        { & $script:Script 6>&1 | Out-Null } | Should -Throw -ExpectedMessage '*CLAUDE.md*'
+
+        (Get-Item -LiteralPath (Join-Path $acct 'projects') -Force).Target |
+            Should -Match 'claude-shared'
+    }
+}
