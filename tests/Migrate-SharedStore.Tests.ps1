@@ -414,3 +414,111 @@ Describe 'migrate-shared-store.ps1 retargeting' {
             Should -Match 'somewhere-else'
     }
 }
+
+Describe 'migrate-shared-store.ps1 handoff and report' {
+    BeforeEach {
+        $script:FakeHome = New-LegacyFakeHome   # swaps $HOME AND $PROFILE
+        $script:Script   = Join-Path (Split-Path $PSScriptRoot -Parent) 'migrate-shared-store.ps1'
+        $null = New-LegacyAccount -Name work
+    }
+    AfterEach { Remove-LegacyFakeHome -Path $script:FakeHome }
+
+    It 'forwards -DryRun to setup so the handoff writes nothing' {
+        # -NoSeed does NOT make setup inert: it still copies statusline.sh,
+        # rewrites settings.json and creates links.
+        $out = & $script:Script -DryRun 6>&1 | Out-String -Width 500
+
+        Test-Path -LiteralPath (Join-Path $script:FakeHome '.claude\settings.json') |
+            Should -BeFalse
+        Test-Path -LiteralPath $PROFILE | Should -BeFalse
+        $out | Should -Match 'DRY RUN'
+        $out | Should -Match 'would re-run install\.ps1'
+    }
+
+    It 'hands stripped account names to setup and re-runs install against the new store' {
+        $legacyInstalled = Join-Path $script:FakeHome '.claude-shared\bin\claude-account-profile.ps1'
+        $oldBlock = "# >>> claude-account-switch >>>`r`n. `"$legacyInstalled`"`r`n# <<< claude-account-switch <<<"
+        [IO.File]::WriteAllText($PROFILE, $oldBlock, (New-Object Text.UTF8Encoding $false))
+
+        $out = & $script:Script 6>&1 | Out-String -Width 500
+
+        $profileText = Get-Content -LiteralPath $PROFILE -Raw
+        $newInstalled = Join-Path $script:FakeHome '.claude\bin\claude-account-profile.ps1'
+        $out | Should -Match "Account 'work'"
+        $profileText | Should -Match ([regex]::Escape($newInstalled))
+        $profileText | Should -Not -Match ([regex]::Escape($legacyInstalled))
+        Test-Path -LiteralPath $newInstalled -PathType Leaf | Should -BeTrue
+    }
+
+    It 'withholds deletion guidance and keeps the manifest when a conflict was reported' {
+        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude-shared\skills\c.md') -Value 'legacy'
+        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude\skills\c.md')        -Value 'store'
+
+        $out = & $script:Script 6>&1 | Out-String -Width 500
+
+        $out | Should -Not -Match 'safe to delete'
+        $out | Should -Match 'unresolved'
+        Test-Path -LiteralPath (Join-Path $script:FakeHome '.claude\.migrate-shared-store.state') |
+            Should -BeTrue
+    }
+
+    It 'leaves the legacy store on disk no matter what' {
+        & $script:Script 6>&1 | Out-Null
+        Test-Path -LiteralPath (Join-Path $script:FakeHome '.claude-shared') | Should -BeTrue
+    }
+
+    It 'removes the manifest on a clean run' {
+        & $script:Script 6>&1 | Out-Null
+        Test-Path -LiteralPath (Join-Path $script:FakeHome '.claude\.migrate-shared-store.state') |
+            Should -BeFalse
+    }
+
+    It 'offers only qualified deletion guidance after a clean handoff' {
+        $out = & $script:Script 6>&1 | Out-String -Width 500
+
+        $out | Should -Match 'safe to delete ONLY after you open a NEW shell'
+        $out | Should -Match 'Get-ClaudeAccount still works'
+    }
+
+    It 'withholds deletion guidance when mandatory install.ps1 is missing' {
+        $fakeRepo = Join-Path $script:FakeHome 'repo-without-install'
+        $null = New-Item -ItemType Directory -Path $fakeRepo -Force
+        $copiedMigration = Join-Path $fakeRepo 'migrate-shared-store.ps1'
+        Copy-Item -LiteralPath $script:Script -Destination $copiedMigration
+
+        $stubSetup = @'
+[CmdletBinding()]
+param([string[]] $Accounts, [switch] $NoSeed, [switch] $DryRun)
+'@
+        [IO.File]::WriteAllText((Join-Path $fakeRepo 'setup-claude-accounts.ps1'), $stubSetup,
+                                (New-Object Text.UTF8Encoding $false))
+
+        $out = & $copiedMigration 6>&1 | Out-String -Width 500
+
+        $out | Should -Match 'cannot find .*install\.ps1'
+        $out | Should -Not -Match 'safe to delete'
+        Test-Path -LiteralPath (Join-Path $script:FakeHome '.claude\.migrate-shared-store.state') |
+            Should -BeTrue
+    }
+}
+
+Describe 'migrate-shared-store.ps1 handoff with no discovered accounts' {
+    BeforeEach {
+        $script:FakeHome = New-LegacyFakeHome   # swaps $HOME AND $PROFILE
+        $script:Script   = Join-Path (Split-Path $PSScriptRoot -Parent) 'migrate-shared-store.ps1'
+    }
+    AfterEach { Remove-LegacyFakeHome -Path $script:FakeHome }
+
+    It 'still re-runs mandatory install.ps1' {
+        $legacyInstalled = Join-Path $script:FakeHome '.claude-shared\bin\claude-account-profile.ps1'
+        $oldBlock = "# >>> claude-account-switch >>>`r`n. `"$legacyInstalled`"`r`n# <<< claude-account-switch <<<"
+        [IO.File]::WriteAllText($PROFILE, $oldBlock, (New-Object Text.UTF8Encoding $false))
+
+        & $script:Script 6>&1 | Out-Null
+
+        $profileText = Get-Content -LiteralPath $PROFILE -Raw
+        $newInstalled = Join-Path $script:FakeHome '.claude\bin\claude-account-profile.ps1'
+        $profileText | Should -Match ([regex]::Escape($newInstalled))
+        $profileText | Should -Not -Match ([regex]::Escape($legacyInstalled))
+    }
+}

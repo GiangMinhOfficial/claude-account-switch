@@ -536,3 +536,79 @@ if ($script:Drifted.Count -gt 0) {
 } else {
     Write-Done "the legacy store did not change during this run"
 }
+
+# ------------------------------------------------------------ phase 3 --------
+
+Write-Head "Setup and install"
+
+$repoRoot  = $PSScriptRoot
+$setup     = Join-Path $repoRoot 'setup-claude-accounts.ps1'
+$install   = Join-Path $repoRoot 'install.ps1'
+$names     = @($accounts | ForEach-Object { $_.Name -replace '^\.claude-', '' })
+$setupOk   = $false
+$installOk = $false
+
+if ($names.Count -eq 0) {
+    Write-Skip "no accounts to hand off"
+    $setupOk = $true
+} elseif ($refused.Count -gt 0) {
+    # setup's New-Junction would throw on the same real directory and prevent
+    # Phase 4 from reporting every refusal and withholding deletion guidance.
+    Write-Warn "setup was not run because retargeting refused one or more directories"
+} elseif (-not (Test-Path -LiteralPath $setup -PathType Leaf)) {
+    Write-Warn "cannot find $setup - skipping the setup handoff"
+} else {
+    # -DryRun MUST be forwarded. -NoSeed alone does not make setup inert: it
+    # would still copy statusline.sh, rewrite settings.json and create links.
+    & $setup -Accounts $names -NoSeed -DryRun:$DryRun
+    $setupOk = $true
+}
+
+# install.ps1 is not optional: an existing $PROFILE block holds an absolute
+# path into .claude-shared\bin, and copying bin/ does not update it. This runs
+# even when there are no accounts for setup to hand off.
+if (-not (Test-Path -LiteralPath $install -PathType Leaf)) {
+    Write-Warn "cannot find $install - the mandatory install handoff is incomplete"
+} elseif ($DryRun) {
+    Write-Step "would re-run install.ps1"
+    $installOk = $true
+} else {
+    & $install
+    $installOk = $true
+}
+
+$phase3Ok = $setupOk -and $installOk
+
+# ------------------------------------------------------------ phase 4 --------
+
+Write-Head "Done"
+Write-Host "  copied     : $($script:Copied)"
+Write-Host "  overwritten: $($script:Overwrote) (plugins registry)"
+Write-Host "  superseded : $($script:Superseded)"
+Write-Host "  adopted    : $($script:Adopted)"
+Write-Host "  rescued    : $($script:Rescued.Count)"
+foreach ($r in $script:Rescued) { Write-Step $r }
+if ($script:Conflicts.Count -gt 0) {
+    Write-Warn "$($script:Conflicts.Count) unresolved conflict(s) - the store's copy was kept:"
+    foreach ($c in $script:Conflicts | Select-Object -First 10) { Write-Step $c }
+}
+if ($refused.Count -gt 0) {
+    Write-Warn "$($refused.Count) real directories refused - move them yourself and re-run:"
+    foreach ($r in $refused) { Write-Step $r }
+}
+
+$clean = ($script:Drifted.Count -eq 0) -and ($script:Conflicts.Count -eq 0) -and
+         ($refused.Count -eq 0) -and $phase3Ok
+
+Write-Host ""
+if ($DryRun) {
+    Write-Host "  Dry run only - nothing was changed."
+} elseif ($clean) {
+    if (Test-Path -LiteralPath $ManifestPath) { Remove-Item -LiteralPath $ManifestPath -Force }
+    Write-Host "  $Legacy is kept as a full standby copy."
+    Write-Host "  It is safe to delete ONLY after you open a NEW shell and confirm" -ForegroundColor Green
+    Write-Host "  Get-ClaudeAccount still works - your `$PROFILE may still point into it."
+} else {
+    Write-Warn "Not finished. $Legacy has been left untouched - do NOT delete it."
+    Write-Host "  Fix what is listed above and run this again. The merge is idempotent."
+}
