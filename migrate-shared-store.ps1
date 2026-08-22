@@ -51,7 +51,9 @@ function Test-JunctionInto {
     if (-not $target) { return $false }
     # Resolve-Path keeps a trailing separator and throws on a missing path, so
     # compare trimmed strings rather than resolving.
-    return $target.TrimEnd('\', '/').StartsWith($Root.TrimEnd('\', '/'), 'OrdinalIgnoreCase')
+    $t = $target.TrimEnd('\', '/')
+    $r = $Root.TrimEnd('\', '/')
+    return ($t -eq $r) -or $t.StartsWith($r + '\', 'OrdinalIgnoreCase')
 }
 
 function Read-MigrationManifest {
@@ -177,8 +179,8 @@ if ($divergent.Count -gt 0) {
     # later anyway, but only after Phase 2 had already retargeted the
     # junctions - and every re-run would then fail the same way.
     throw ("Refusing to migrate: these CLAUDE.md files have content of their own`n" +
-           ($divergent | ForEach-Object { "         $_" }) -join "`n") + "`n" +
-          "       Merge what you want to keep into $storeMemory, delete the copy, then re-run."
+           (($divergent | ForEach-Object { "         $_" }) -join "`n") + "`n" +
+           "       Merge what you want to keep into $storeMemory, delete the copy, then re-run.")
 }
 Write-Done "CLAUDE.md is consistent across every account"
 
@@ -186,9 +188,9 @@ Write-MigrationManifest -Accounts @($accounts | ForEach-Object { $_.FullName })
 
 # ------------------------------------------------------------ phase 1 --------
 
-# Every legacy file this run READ, with the size and timestamp it had at the
-# time. Phase 2b re-checks these: a change means something wrote during the run
-# and the merge is incomplete.
+# Every legacy file present at the Phase 1 baseline, with its size and timestamp.
+# Phase 2b re-checks these: a change means something wrote during the run and the
+# merge is incomplete.
 $script:ReadFiles  = @{}
 $script:Conflicts  = @()
 $script:Copied     = 0
@@ -202,24 +204,28 @@ function Register-ReadFile {
     }
 }
 
+# Phase 2b walks the whole legacy tree, so its baseline must cover that same
+# whole tree. Files created after this walk stay unregistered and count as drift.
+Get-ChildItem -LiteralPath $Legacy -Recurse -File -Force -ErrorAction SilentlyContinue |
+    ForEach-Object { Register-ReadFile -Item $_ }
+
 function Copy-LegacyTree {
     # Walks one legacy subtree and applies a per-source policy.
     #   Missing      -> copy
     #   Identical    -> skip
-    #   Differs      -> $OnConflict decides: 'keep-store' or 'legacy-wins'
+    #   Differs      -> $OnConflict decides: record, overwrite, or skip
     # projects/ is handled separately in Phase 1b: transcripts need classifying,
     # not a flat rule.
     param(
         [string] $Source,
         [string] $Destination,
-        [ValidateSet('keep-store', 'legacy-wins')] [string] $OnConflict
+        [ValidateSet('keep-store', 'legacy-wins', 'add-only')] [string] $OnConflict
     )
 
     if (-not (Test-Path -LiteralPath $Source)) { return }
 
     Get-ChildItem -LiteralPath $Source -Recurse -File -Force -ErrorAction SilentlyContinue |
         ForEach-Object {
-            Register-ReadFile -Item $_
             $relative = $_.FullName.Substring($Source.Length).TrimStart('\')
             $target   = Join-Path $Destination $relative
 
@@ -241,7 +247,7 @@ function Copy-LegacyTree {
                 if ($DryRun) { Write-Step "would overwrite $relative"; return }
                 Copy-Item -LiteralPath $_.FullName -Destination $target -Force
                 $script:Overwrote++
-            } else {
+            } elseif ($OnConflict -eq 'keep-store') {
                 $script:Conflicts += $target
             }
         }
@@ -261,14 +267,13 @@ foreach ($dir in @('skills', 'agents', 'commands', 'hooks')) {
 Copy-LegacyTree -Source (Join-Path $Legacy 'plugins') -Destination (Join-Path $Store 'plugins') `
                 -OnConflict 'legacy-wins'
 
-# Store-only artifacts: they belong in the store but are never shared into an
-# account, so setup excludes them from seeding.
+# Store-only artifacts: install.ps1 owns the store's copy, so bin/ is add-only.
+# Recording a conflict here would make every run after install falsely unclean.
 Copy-LegacyTree -Source (Join-Path $Legacy 'bin') -Destination (Join-Path $Store 'bin') `
-                -OnConflict 'keep-store'
+                -OnConflict 'add-only'
 
 $legacyStatusLine = Join-Path $Legacy 'statusline.sh'
 if (Test-Path -LiteralPath $legacyStatusLine -PathType Leaf) {
-    Register-ReadFile -Item (Get-Item -LiteralPath $legacyStatusLine -Force)
     $target = Join-Path $Store 'statusline.sh'
     if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
         if ($DryRun) {
@@ -375,7 +380,6 @@ function Copy-LegacyProjects {
             # switch and the parse-gate pipeline both rebind $_, so preserve the
             # legacy FileInfo before entering either nested scope.
             $legacyFile = $_
-            Register-ReadFile -Item $legacyFile
             $relative = $legacyFile.FullName.Substring($source.Length).TrimStart('\')
             $target   = Join-Path $dest $relative
 
@@ -451,6 +455,13 @@ foreach ($acct in $accounts) {
         if (-not (Test-Path -LiteralPath $link)) {
             if ($DryRun) { Write-Step "would link $link"; continue }
             $null = cmd /c mklink /J "$link" "$newTarget"
+            if (-not (Test-Path -LiteralPath $link)) {
+                throw "Failed to create junction: $link"
+            }
+            $created = Get-Item -LiteralPath $link -Force
+            if (-not ($created.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw "Failed to create junction: $link"
+            }
             Write-Done "linked $($acct.Name)\$dir"
             continue
         }
@@ -487,13 +498,20 @@ foreach ($acct in $accounts) {
         # depends on.
         cmd /c rmdir "$link" | Out-Null
         $null = cmd /c mklink /J "$link" "$newTarget"
+        if (-not (Test-Path -LiteralPath $link)) {
+            throw "Failed to create junction: $link"
+        }
+        $created = Get-Item -LiteralPath $link -Force
+        if (-not ($created.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Failed to create junction: $link"
+        }
         Write-Done "retargeted $($acct.Name)\$dir"
     }
 }
 
 # ----------------------------------------------------------- phase 2b --------
 
-if ($SimulateDriftPath) {
+if ($SimulateDriftPath -and -not $DryRun) {
     Add-Content -LiteralPath $SimulateDriftPath -Value 'appended during the run'
 }
 
@@ -548,15 +566,17 @@ $names     = @($accounts | ForEach-Object { $_.Name -replace '^\.claude-', '' })
 $setupOk   = $false
 $installOk = $false
 
-if ($names.Count -eq 0) {
-    Write-Skip "no accounts to hand off"
-    $setupOk = $true
-} elseif ($refused.Count -gt 0) {
+if ($refused.Count -gt 0) {
     # setup's New-Junction would throw on the same real directory and prevent
     # Phase 4 from reporting every refusal and withholding deletion guidance.
     Write-Warn "setup was not run because retargeting refused one or more directories"
 } elseif (-not (Test-Path -LiteralPath $setup -PathType Leaf)) {
     Write-Warn "cannot find $setup - skipping the setup handoff"
+} elseif ($names.Count -eq 0) {
+    # Even without named accounts, setup refreshes the fallback store's status
+    # line script and settings.json. -NoSeed keeps account seeding disabled.
+    & $setup -Accounts @() -NoSeed -DryRun:$DryRun
+    $setupOk = $true
 } else {
     # -DryRun MUST be forwarded. -NoSeed alone does not make setup inert: it
     # would still copy statusline.sh, rewrite settings.json and create links.

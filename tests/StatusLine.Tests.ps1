@@ -176,6 +176,15 @@ Describe 'setup-claude-accounts.ps1 shares the status line' {
         # for the wrong reason.
         $out | Should -Match 'This run changed:.*statusline\.sh'
         $out | Should -Not -Match 'not modified'
+
+        [IO.File]::WriteAllText(
+            (Join-Path $script:FakeHome '.claude\statusline.sh'),
+            '# stale again for dry run',
+            (New-Object Text.UTF8Encoding $false)
+        )
+        $dryOut = & $script:SetupScript -Accounts work -NoSeed -DryRun 6>&1 |
+                      Out-String -Width 500
+        $dryOut | Should -Match 'This run would change:.*statusline\.sh'
     }
 
     It 'replaces a status line the account already had, and says what it was' {

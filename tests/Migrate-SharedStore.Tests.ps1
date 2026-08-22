@@ -63,11 +63,14 @@ Describe 'migrate-shared-store.ps1 discovery' {
 
     It 'writes nothing under -DryRun' {
         $acct = New-LegacyAccount -Name work
-        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude-shared\projects\only-legacy.txt') -Value 'x'
+        $legacyFile = Join-Path $script:FakeHome '.claude-shared\projects\only-legacy.txt'
+        Set-Content -LiteralPath $legacyFile -Value 'x'
+        $before = (Get-FileHash -LiteralPath $legacyFile).Hash
 
-        $null = & $script:Script -DryRun 6>&1
+        $null = & $script:Script -DryRun -SimulateDriftPath $legacyFile 6>&1
 
         Test-Path -LiteralPath (Join-Path $script:FakeHome '.claude\projects\only-legacy.txt') | Should -BeFalse
+        (Get-FileHash -LiteralPath $legacyFile).Hash | Should -Be $before
         (Get-Item -LiteralPath (Join-Path $acct 'projects') -Force).Target |
             Should -Match 'claude-shared'
     }
@@ -86,10 +89,16 @@ Describe 'migrate-shared-store.ps1 preflight' {
         # THEN setup's New-FileLink throws - leaving a half-migrated machine
         # that every re-run fails on identically.
         $acct = New-LegacyAccount -Name work
+        $personal = New-LegacyAccount -Name personal
         Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude\CLAUDE.md') -Value 'store memory'
         Set-Content -LiteralPath (Join-Path $acct 'CLAUDE.md') -Value 'DIVERGENT account memory'
+        Set-Content -LiteralPath (Join-Path $personal 'CLAUDE.md') -Value 'ANOTHER divergent memory'
 
-        { & $script:Script 6>&1 | Out-Null } | Should -Throw -ExpectedMessage '*CLAUDE.md*'
+        $err = { & $script:Script 6>&1 | Out-Null } |
+            Should -Throw -ExpectedMessage '*CLAUDE.md*' -PassThru
+        @($err.Exception.Message -split "`r?`n" |
+            Where-Object { $_ -match '\.claude-(work|personal)\\CLAUDE\.md' }).Count |
+            Should -Be 2
 
         # Nothing mutated: the junction still points at the legacy store and
         # discovery did not persist its interruption manifest.
@@ -402,7 +411,7 @@ Describe 'migrate-shared-store.ps1 retargeting' {
         # final gate bless deleting the legacy store while this account still
         # reads and writes to a third location.
         $acct  = New-LegacyAccount -Name work -Dirs @('projects')
-        $other = Join-Path $script:FakeHome 'somewhere-else'
+        $other = Join-Path $script:FakeHome '.claude-backup\skills'
         $null  = New-Item -ItemType Directory -Path $other -Force
         $null  = cmd /c mklink /J "$acct\skills" "$other"
 
@@ -411,7 +420,7 @@ Describe 'migrate-shared-store.ps1 retargeting' {
         $out | Should -Match 'Unexpected junction target'
         $out | Should -Not -Match 'safe to delete'
         @((Get-Item -LiteralPath (Join-Path $acct 'skills') -Force).Target)[0] |
-            Should -Match 'somewhere-else'
+            Should -Match '\.claude-backup'
     }
 }
 
@@ -480,6 +489,33 @@ Describe 'migrate-shared-store.ps1 handoff and report' {
         $out | Should -Match 'Get-ClaudeAccount still works'
     }
 
+    It 'offers deletion guidance when the legacy root contains a hardlinked CLAUDE.md' {
+        Set-Content -LiteralPath (Join-Path $script:FakeHome '.claude\CLAUDE.md') -Value 'shared memory'
+        $null = cmd /c mklink /H "$(Join-Path $script:FakeHome '.claude-shared\CLAUDE.md')" `
+                                    "$(Join-Path $script:FakeHome '.claude\CLAUDE.md')"
+
+        $out = & $script:Script 6>&1 | Out-String -Width 500
+
+        $out | Should -Match 'safe to delete ONLY after you open a NEW shell'
+    }
+
+    It 'offers deletion guidance on a second consecutive clean run' {
+        $legacyBin = Join-Path $script:FakeHome '.claude-shared\bin'
+        $null = New-Item -ItemType Directory -Path $legacyBin -Force
+        [IO.File]::WriteAllText(
+            (Join-Path $legacyBin 'claude-account-profile.ps1'),
+            '# legacy installed profile',
+            (New-Object Text.UTF8Encoding $false)
+        )
+
+        $first = & $script:Script 6>&1 | Out-String -Width 500
+        $second = & $script:Script 6>&1 | Out-String -Width 500
+
+        $first  | Should -Match 'safe to delete ONLY after you open a NEW shell'
+        $second | Should -Match 'safe to delete ONLY after you open a NEW shell'
+        $second | Should -Not -Match 'unresolved conflict'
+    }
+
     It 'withholds deletion guidance when mandatory install.ps1 is missing' {
         $fakeRepo = Join-Path $script:FakeHome 'repo-without-install'
         $null = New-Item -ItemType Directory -Path $fakeRepo -Force
@@ -513,12 +549,21 @@ Describe 'migrate-shared-store.ps1 handoff with no discovered accounts' {
         $legacyInstalled = Join-Path $script:FakeHome '.claude-shared\bin\claude-account-profile.ps1'
         $oldBlock = "# >>> claude-account-switch >>>`r`n. `"$legacyInstalled`"`r`n# <<< claude-account-switch <<<"
         [IO.File]::WriteAllText($PROFILE, $oldBlock, (New-Object Text.UTF8Encoding $false))
+        $settings = Join-Path $script:FakeHome '.claude\settings.json'
+        [IO.File]::WriteAllText(
+            $settings,
+            '{"statusLine":{"type":"command","command":"legacy/.claude-shared/statusline.sh"}}',
+            (New-Object Text.UTF8Encoding $false)
+        )
 
         & $script:Script 6>&1 | Out-Null
 
         $profileText = Get-Content -LiteralPath $PROFILE -Raw
+        $settingsText = Get-Content -LiteralPath $settings -Raw
         $newInstalled = Join-Path $script:FakeHome '.claude\bin\claude-account-profile.ps1'
         $profileText | Should -Match ([regex]::Escape($newInstalled))
         $profileText | Should -Not -Match ([regex]::Escape($legacyInstalled))
+        $settingsText | Should -Match '\.claude/statusline\.sh'
+        $settingsText | Should -Not -Match '\.claude-shared/statusline\.sh'
     }
 }

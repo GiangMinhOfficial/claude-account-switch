@@ -81,8 +81,6 @@ Describe 'setup-claude-accounts.ps1 shares CLAUDE.md' {
         & $script:SetupScript -Accounts work, personal -SeedInto work 6>&1 | Out-Null
 
         $real = Join-Path $script:FakeHome '.claude\CLAUDE.md'
-        Test-OneInode (Join-Path $script:FakeHome '.claude-work\CLAUDE.md') `
-                      (Join-Path $script:FakeHome '.claude\CLAUDE.md') | Should -BeTrue
         Test-OneInode (Join-Path $script:FakeHome '.claude-work\CLAUDE.md')     $real | Should -BeTrue
         Test-OneInode (Join-Path $script:FakeHome '.claude-personal\CLAUDE.md') $real | Should -BeTrue
     }
@@ -220,6 +218,7 @@ Describe 'setup-claude-accounts.ps1 -DryRun with no CLAUDE.md anywhere' {
     It 'says it would create the file in ~/.claude, and does not' {
         # ~/.claude gaining a file is the single exception to "nothing in
         # ~/.claude is modified", so a dry run must not claim it already did.
+        Remove-Item -LiteralPath (Join-Path $script:FakeHome '.claude') -Recurse -Force
         $out = & $script:SetupScript -Accounts work -NoSeed -DryRun 6>&1 | Out-String -Width 500
 
         $out | Should -Match 'would create an empty CLAUDE\.md'

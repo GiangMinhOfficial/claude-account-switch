@@ -221,7 +221,7 @@ Describe 'Rename-ClaudeAccount source guards' {
     It 'refuses to rename the shared store' {
         { Rename-ClaudeAccount -Name 'shared' -NewName 'dst' -ErrorAction Stop } |
             Should -Throw -ExpectedMessage '*shared store*'
-        Test-Path -LiteralPath (Join-Path $HOME '.claude') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $HOME '.claude-dst') | Should -BeFalse
     }
 
     It 'names the missing projects/ entry for a directory that is not an account' {

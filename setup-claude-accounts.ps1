@@ -215,6 +215,7 @@ function Find-SharedFilePeer {
     # are where a deleted store file has to be recovered from.
     param([string] $FileName, [string] $Store)
 
+    if (-not (Test-Path -LiteralPath $Store)) { return $null }
     $storeFull = (Get-Item -LiteralPath $Store -Force).FullName.TrimEnd('\')
     Get-ChildItem -Path $HOME -Directory -Filter '.claude-*' -Force -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName.TrimEnd('\') -ne $storeFull } |
@@ -557,6 +558,7 @@ if (-not $NoStatusLine) {
             Write-Skip "up to date $target"
         } elseif ($DryRun) {
             Write-Step "would copy $StatusLine -> $target"
+            $SeedFromEdits += [IO.Path]::GetFileName($StatusLine)
         } else {
             Copy-Item -LiteralPath $StatusLine -Destination $target -Force
             Write-Done "copied $([IO.Path]::GetFileName($StatusLine)) -> $Shared"
