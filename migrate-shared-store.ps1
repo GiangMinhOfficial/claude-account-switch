@@ -278,4 +278,156 @@ if (Test-Path -LiteralPath $legacyStatusLine -PathType Leaf) {
 # CLAUDE.md needs nothing: preflight already proved every name is one inode, so
 # the store's copy IS the legacy store's copy.
 
+# ----------------------------------------------------------- phase 1b --------
+
+$script:Superseded = 0
+$script:Adopted    = 0
+$script:Rescued    = @()
+
+function Test-JsonLine {
+    param([string] $Line)
+    if ([string]::IsNullOrWhiteSpace($Line)) { return $true }
+    try { $null = ConvertFrom-Json $Line; return $true } catch { return $false }
+}
+
+function Get-JsonlRelation {
+    # 'identical' | 'superseded' | 'continued' | 'forked'
+    #
+    # superseded: legacy is a strict line-prefix of store  -> store already has it
+    # continued : store is a strict line-prefix of legacy  -> legacy has more
+    # forked    : neither is a prefix of the other
+    param([string] $Store, [string] $Legacy)
+
+    $s = @(Get-Content -LiteralPath $Store  -ErrorAction SilentlyContinue)
+    $l = @(Get-Content -LiteralPath $Legacy -ErrorAction SilentlyContinue)
+    $shorter = [Math]::Min($s.Count, $l.Count)
+
+    for ($i = 0; $i -lt $shorter; $i++) {
+        if ($s[$i] -ne $l[$i]) { return 'forked' }
+    }
+    if ($s.Count -eq $l.Count) { return 'identical' }
+    if ($l.Count -lt $s.Count) { return 'superseded' }
+    return 'continued'
+}
+
+function Get-RescueId {
+    # DETERMINISTIC, not random. A random GUID would make rescue the one
+    # non-idempotent step in the script: the legacy and store copies stay forked
+    # after a rescue, so the next run classifies them as forked again and writes
+    # ANOTHER copy. Every re-run - which is the documented recovery for a drift
+    # or conflict abort - would multiply the transcript.
+    #
+    # Deriving the id from the old id plus the legacy file's content means a
+    # re-run computes the same name, finds the file already there, and skips.
+    # MD5 is 16 bytes, which is exactly a GUID; it is used here as a
+    # content-addressing function, not for security.
+    param([string] $OldId, [string] $LegacyPath)
+
+    $seed = $OldId + ':' + (Get-FileHash -LiteralPath $LegacyPath -Algorithm MD5).Hash
+    $md5  = [Security.Cryptography.MD5]::Create()
+    try {
+        $bytes = $md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($seed))
+    } finally {
+        $md5.Dispose()
+    }
+    return ([guid][byte[]]$bytes).ToString()
+}
+
+function New-RescuedTranscript {
+    # Copy a forked legacy transcript in under a stable rescue id so both halves
+    # are resumable. Only the two top-level id FIELDS are rewritten: the other
+    # mentions of the id in a transcript are temp scratchpad paths and tool
+    # output, which are a historical record and resolve to nothing we own.
+    #
+    # Sidecar <id>/ directories are deliberately NOT renamed. Phase 1's
+    # add-if-missing pass already merged any sidecar files, and renaming one
+    # without rewriting the transcript's references to it would break them.
+    param([string] $LegacyPath, [string] $Destination, [string] $OldId)
+
+    $newId  = Get-RescueId -OldId $OldId -LegacyPath $LegacyPath
+    $target = Join-Path $Destination "$newId.jsonl"
+
+    if (Test-Path -LiteralPath $target -PathType Leaf) {
+        # An earlier run already rescued this exact content.
+        return $null
+    }
+
+    $text = [IO.File]::ReadAllText($LegacyPath)
+    $text = $text.Replace("`"sessionId`":`"$OldId`"",  "`"sessionId`":`"$newId`"")
+    $text = $text.Replace("`"session_id`":`"$OldId`"", "`"session_id`":`"$newId`"")
+
+    [IO.File]::WriteAllText($target, $text, (New-Object Text.UTF8Encoding $false))
+    return $newId
+}
+
+function Copy-LegacyProjects {
+    $source = Join-Path $Legacy 'projects'
+    $dest   = Join-Path $Store  'projects'
+    if (-not (Test-Path -LiteralPath $source)) { return }
+
+    Get-ChildItem -LiteralPath $source -Recurse -File -Force -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            # switch and the parse-gate pipeline both rebind $_, so preserve the
+            # legacy FileInfo before entering either nested scope.
+            $legacyFile = $_
+            Register-ReadFile -Item $legacyFile
+            $relative = $legacyFile.FullName.Substring($source.Length).TrimStart('\')
+            $target   = Join-Path $dest $relative
+
+            if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
+                if ($DryRun) { Write-Step "would copy $relative"; return }
+                $parent = Split-Path $target -Parent
+                if (-not (Test-Path -LiteralPath $parent)) {
+                    $null = New-Item -ItemType Directory -Path $parent -Force
+                }
+                Copy-Item -LiteralPath $legacyFile.FullName -Destination $target -Force
+                $script:Copied++
+                return
+            }
+
+            if ((Get-FileHash -LiteralPath $legacyFile.FullName).Hash -eq
+                (Get-FileHash -LiteralPath $target).Hash) { return }
+
+            if ($legacyFile.Extension -ne '.jsonl') { $script:Conflicts += $target; return }
+
+            switch (Get-JsonlRelation -Store $target -Legacy $legacyFile.FullName) {
+                'identical'  { }
+                'superseded' { $script:Superseded++ }
+                'continued'  {
+                    # Validate every ADDED line before letting it replace a file
+                    # that currently parses. Strict prefix says nothing about
+                    # the suffix, and a truncated tail satisfies it exactly.
+                    $storeCount = @(Get-Content -LiteralPath $target).Count
+                    $added      = @(Get-Content -LiteralPath $legacyFile.FullName) |
+                                      Select-Object -Skip $storeCount
+                    if (@($added | Where-Object { -not (Test-JsonLine -Line $_) }).Count -gt 0) {
+                        $script:Conflicts += $target
+                        Write-Warn "not adopted (malformed added line): $relative"
+                        return
+                    }
+                    if ($DryRun) { Write-Step "would adopt $relative"; return }
+                    # Temp file then move, so an interrupted adoption cannot
+                    # leave a half-written transcript where a valid one was.
+                    $tmp  = "$target.migrating"
+                    $text = [IO.File]::ReadAllText($legacyFile.FullName)
+                    [IO.File]::WriteAllText($tmp, $text, (New-Object Text.UTF8Encoding $false))
+                    Move-Item -LiteralPath $tmp -Destination $target -Force
+                    $script:Adopted++
+                }
+                'forked' {
+                    $oldId = [IO.Path]::GetFileNameWithoutExtension($legacyFile.Name)
+                    if ($DryRun) { Write-Step "would rescue $relative under a new id"; return }
+                    $newId = New-RescuedTranscript -LegacyPath $legacyFile.FullName `
+                                                   -Destination (Split-Path $target -Parent) `
+                                                   -OldId $oldId
+                    # $null means an earlier run already rescued this content.
+                    if ($newId) { $script:Rescued += "$oldId -> $newId" }
+                }
+            }
+        }
+}
+
+Copy-LegacyProjects
 Write-Done "$($script:Copied) copied, $($script:Overwrote) overwritten (plugins), $($script:Conflicts.Count) conflicts"
+Write-Done ("projects: {0} superseded, {1} adopted, {2} rescued" -f `
+            $script:Superseded, $script:Adopted, $script:Rescued.Count)
