@@ -20,7 +20,12 @@
 #>
 [CmdletBinding()]
 param(
-    [switch] $DryRun
+    [switch] $DryRun,
+
+    # Test seam: rewrite this legacy file after Phase 1 has recorded it, to
+    # exercise the Phase 2b drift check. There is no honest way to race a real
+    # Claude Code session from a test.
+    [string] $SimulateDriftPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -431,3 +436,103 @@ Copy-LegacyProjects
 Write-Done "$($script:Copied) copied, $($script:Overwrote) overwritten (plugins), $($script:Conflicts.Count) conflicts"
 Write-Done ("projects: {0} superseded, {1} adopted, {2} rescued" -f `
             $script:Superseded, $script:Adopted, $script:Rescued.Count)
+
+# ------------------------------------------------------------ phase 2 --------
+
+Write-Head "Retarget"
+
+$refused = @()
+
+foreach ($acct in $accounts) {
+    foreach ($dir in $SharedDirs) {
+        $link      = Join-Path $acct.FullName $dir
+        $newTarget = Join-Path $Store $dir
+
+        if (-not (Test-Path -LiteralPath $link)) {
+            if ($DryRun) { Write-Step "would link $link"; continue }
+            $null = cmd /c mklink /J "$link" "$newTarget"
+            Write-Done "linked $($acct.Name)\$dir"
+            continue
+        }
+
+        $item = Get-Item -LiteralPath $link -Force
+        if (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            # A real directory with real content. Refuse, exactly as
+            # New-Junction does - never delete what we did not create.
+            $refused += $link
+            Write-Warn "Refusing to replace real directory: $link"
+            continue
+        }
+        if (-not (Test-JunctionInto -Path $link -Root $Legacy)) {
+            # Three outcomes, not two. A reparse point that is not the legacy
+            # store is NOT automatically the new store: it can point at a
+            # backup, a stale path, or anywhere the user aimed it. Calling that
+            # "already migrated" would let the final gate bless deleting the
+            # legacy store while this account still reads and writes elsewhere -
+            # and setup will not catch it either, because New-Junction checks
+            # only the reparse-point attribute.
+            if (Test-JunctionInto -Path $link -Root $Store) {
+                Write-Skip "already points at the store: $($acct.Name)\$dir"
+            } else {
+                $target = @((Get-Item -LiteralPath $link -Force).Target) | Select-Object -First 1
+                $refused += $link
+                Write-Warn "Unexpected junction target, leaving it alone: $link -> $target"
+            }
+            continue
+        }
+        if ($DryRun) { Write-Step "would retarget $link"; continue }
+
+        # rmdir, never Remove-Item -Recurse: on 5.1 that follows the junction
+        # and would empty the legacy store - the standby copy this whole design
+        # depends on.
+        cmd /c rmdir "$link" | Out-Null
+        $null = cmd /c mklink /J "$link" "$newTarget"
+        Write-Done "retargeted $($acct.Name)\$dir"
+    }
+}
+
+# ----------------------------------------------------------- phase 2b --------
+
+if ($SimulateDriftPath) {
+    Add-Content -LiteralPath $SimulateDriftPath -Value 'appended during the run'
+}
+
+Write-Head "Stability check"
+
+# Re-enumerate the WHOLE legacy tree, rather than only re-checking the files
+# Phase 1 happened to read. A live Claude Code session does not just append to
+# transcripts it already had - it creates new ones. A file that appeared after
+# Phase 1 enumerated the tree is absent from $script:ReadFiles, so a check that
+# only walks those keys cannot see it, would report no drift, and would go on to
+# bless deleting a legacy store holding a transcript that was never merged.
+$script:Drifted = @()
+$seenNow        = @{}
+
+Get-ChildItem -LiteralPath $Legacy -Recurse -File -Force -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        $seenNow[$_.FullName] = $true
+        $then = $script:ReadFiles[$_.FullName]
+        if ($null -eq $then) {
+            # Created during the run, so it was never merged.
+            $script:Drifted += $_.FullName
+        } elseif ($_.Length -ne $then.Length -or $_.LastWriteTimeUtc -ne $then.LastWriteTimeUtc) {
+            $script:Drifted += $_.FullName
+        }
+    }
+
+foreach ($path in $script:ReadFiles.Keys) {
+    # Disappeared during the run. Not a merge gap, but it means the source moved
+    # under us and the run's picture of it is stale either way.
+    if (-not $seenNow.ContainsKey($path)) { $script:Drifted += $path }
+}
+
+if ($script:Drifted.Count -gt 0) {
+    # Something wrote to the legacy store while this ran - almost certainly a
+    # live Claude Code session. Those lines were never merged, so the merge is
+    # incomplete and the standby copy must not be deleted.
+    Write-Warn "$($script:Drifted.Count) file(s) changed during this run:"
+    foreach ($p in $script:Drifted | Select-Object -First 10) { Write-Step $p }
+    Write-Warn "Close all Claude Code sessions and re-run. The merge is idempotent."
+} else {
+    Write-Done "the legacy store did not change during this run"
+}

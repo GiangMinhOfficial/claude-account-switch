@@ -338,3 +338,79 @@ Describe 'migrate-shared-store.ps1 transcripts' {
         ($after2 -join ',') | Should -Be ($after1 -join ',')
     }
 }
+
+Describe 'migrate-shared-store.ps1 retargeting' {
+    BeforeEach {
+        $script:FakeHome = New-LegacyFakeHome   # swaps $HOME AND $PROFILE
+        $script:Script   = Join-Path (Split-Path $PSScriptRoot -Parent) 'migrate-shared-store.ps1'
+    }
+    AfterEach { Remove-LegacyFakeHome -Path $script:FakeHome }
+
+    It 'repoints every junction at the store' {
+        $acct = New-LegacyAccount -Name work
+
+        & $script:Script 6>&1 | Out-Null
+
+        foreach ($d in @('projects', 'skills', 'agents', 'commands', 'hooks', 'plugins')) {
+            $target = @((Get-Item -LiteralPath (Join-Path $acct $d) -Force).Target)[0]
+            $target | Should -Match '\.claude\\'
+            $target | Should -Not -Match 'claude-shared'
+        }
+    }
+
+    It 'refuses a real directory instead of deleting it' {
+        $acct = New-LegacyAccount -Name work -Dirs @('projects')
+        $real = Join-Path $acct 'skills'
+        $null = New-Item -ItemType Directory -Path $real -Force
+        Set-Content -LiteralPath (Join-Path $real 'mine.md') -Value 'do not delete me'
+
+        $out = & $script:Script 6>&1 | Out-String -Width 500
+
+        Get-Content -LiteralPath (Join-Path $real 'mine.md') | Should -Be 'do not delete me'
+        $out | Should -Match 'Refusing'
+    }
+
+    It 'reports drift when the legacy store changes mid-run' {
+        # Simulated by touching a legacy file after Phase 1 recorded it. In the
+        # real failure a live Claude Code session appends to a transcript
+        # between merge and retarget and those lines are never merged.
+        $null = New-LegacyAccount -Name work
+        $f = Join-Path $script:FakeHome '.claude-shared\skills\watched.md'
+        Set-Content -LiteralPath $f -Value 'original'
+
+        $out = & $script:Script -SimulateDriftPath $f 6>&1 | Out-String -Width 500
+
+        $out | Should -Match 'changed during this run'
+        $out | Should -Not -Match 'safe to delete'
+    }
+
+    It 'reports drift for a file CREATED after the merge enumerated the tree' {
+        # The likelier shape of the race: a live session starts a new session
+        # rather than appending to one this run already saw. Add-Content creates
+        # the file, so a path that did not exist at Phase 1 simulates it.
+        $null = New-LegacyAccount -Name work
+        $new = Join-Path $script:FakeHome '.claude-shared\projects\brand-new.jsonl'
+
+        $out = & $script:Script -SimulateDriftPath $new 6>&1 | Out-String -Width 500
+
+        $out | Should -Match 'changed during this run'
+        $out | Should -Not -Match 'safe to delete'
+    }
+
+    It 'refuses a junction pointing somewhere that is neither store nor legacy' {
+        # Not automatically "already migrated". Treating it as such would let the
+        # final gate bless deleting the legacy store while this account still
+        # reads and writes to a third location.
+        $acct  = New-LegacyAccount -Name work -Dirs @('projects')
+        $other = Join-Path $script:FakeHome 'somewhere-else'
+        $null  = New-Item -ItemType Directory -Path $other -Force
+        $null  = cmd /c mklink /J "$acct\skills" "$other"
+
+        $out = & $script:Script 6>&1 | Out-String -Width 500
+
+        $out | Should -Match 'Unexpected junction target'
+        $out | Should -Not -Match 'safe to delete'
+        @((Get-Item -LiteralPath (Join-Path $acct 'skills') -Force).Target)[0] |
+            Should -Match 'somewhere-else'
+    }
+}
